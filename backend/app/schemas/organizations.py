@@ -10,6 +10,9 @@ MemberRole = Literal["admin", "buyer", "requester"]
 # request fields are always required by the app.)
 ConfigurableRequiredField = Literal["vat_id", "department"]
 
+# Default dollar threshold below which requests are auto-approved without buyer sign-off.
+DEFAULT_APPROVAL_THRESHOLD: float = 2000.0
+
 
 class CommodityClassificationRule(BaseModel):
     """Per-organization custom rule mapping an item/condition description to a commodity group."""
@@ -31,6 +34,11 @@ class OrganizationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     required_fields: list[ConfigurableRequiredField] = Field(default_factory=list)
+    approval_threshold: float | None = Field(
+        default=None,
+        ge=0,
+        description="Requests with total_cost strictly below this amount are auto-approved without buyer sign-off.",
+    )
     commodity_rules: list[CommodityClassificationRule] | None = None
     accounting_guidelines: str | None = None
 

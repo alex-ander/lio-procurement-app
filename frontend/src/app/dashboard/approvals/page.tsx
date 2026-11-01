@@ -8,6 +8,7 @@ import type { ProcurementRequestWithDetails } from '@/types/database';
 export default function ApprovalsPage() {
   const [requests, setRequests] = useState<ProcurementRequestWithDetails[]>([]);
   const [role, setRole] = useState<api.MemberRole | null>(null);
+  const [approvalThreshold, setApprovalThreshold] = useState<number>(api.DEFAULT_APPROVAL_THRESHOLD);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -20,12 +21,14 @@ export default function ApprovalsPage() {
   const load = async () => {
     setLoading(true);
     try {
-      const [org, list] = await Promise.all([
+      const [org, list, settings] = await Promise.all([
         api.organizations.getMine(),
         api.requests.list(),
+        api.organizations.getSettings().catch(() => null),
       ]);
       setRole(org.role);
       setRequests(list);
+      setApprovalThreshold(settings?.approval_threshold ?? api.DEFAULT_APPROVAL_THRESHOLD);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load requests');
     }
@@ -67,6 +70,15 @@ export default function ApprovalsPage() {
         <h1 className="text-3xl font-semibold tracking-tight text-ink">Approvals</h1>
         <p className="text-ink/55 mt-1.5">
           Review and approve procurement requests for your organization
+          {approvalThreshold > 0 && (
+            <>
+              {' '}· Requests below{' '}
+              <span className="font-medium text-ink">
+                ${approvalThreshold.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+              </span>{' '}
+              are automatically approved
+            </>
+          )}
         </p>
       </div>
 
@@ -158,7 +170,9 @@ export default function ApprovalsPage() {
                       : 'bg-red-100 text-red-700'
                   }`}
                 >
-                  {request.approval_status}
+                  {request.approval_status === 'approved' && !request.approved_by
+                    ? 'auto-approved'
+                    : request.approval_status}
                 </span>
               </div>
             ))}

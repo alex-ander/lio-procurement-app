@@ -49,7 +49,8 @@ class ProcurementRequest(Base, TimestampMixin):
     # Status tracking
     status: Mapped[str] = mapped_column(String, nullable=False, default="open", index=True)
 
-    # Approval: every request needs sign-off by a buyer or admin.
+    # Approval: requests below the org's threshold ($2,000 by default) are
+    # auto-approved; requests at or above the threshold need buyer/admin sign-off.
     approval_status: Mapped[str] = mapped_column(
         String, nullable=False, default="pending", index=True
     )

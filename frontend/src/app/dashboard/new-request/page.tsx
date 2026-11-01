@@ -32,6 +32,7 @@ export default function NewRequestPage() {
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
   const [orderLines, setOrderLines] = useState<OrderLineForm[]>([]);
   const [totalCost, setTotalCost] = useState<number>(0);
+  const [approvalThreshold, setApprovalThreshold] = useState<number>(api.DEFAULT_APPROVAL_THRESHOLD);
 
   // UI state
   const [file, setFile] = useState<File | null>(null);
@@ -44,6 +45,14 @@ export default function NewRequestPage() {
   const suggestTimersRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
 
   useEffect(() => {
+    api.organizations
+      .getSettings()
+      .then((s) => {
+        setApprovalThreshold(s.approval_threshold ?? api.DEFAULT_APPROVAL_THRESHOLD);
+      })
+      .catch(() => {
+        // Non-fatal; default threshold applies
+      });
     const timers = suggestTimersRef.current;
     return () => {
       Object.values(timers).forEach(clearTimeout);
@@ -673,8 +682,21 @@ export default function NewRequestPage() {
 
         {/* Total Cost */}
         <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6">
-          <div className="flex items-center justify-between">
-            <span className="text-lg font-medium text-gray-900">Total Cost</span>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <span className="text-lg font-medium text-gray-900">Total Cost</span>
+              <div className="mt-1">
+                {totalCost < approvalThreshold ? (
+                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+                    ✓ Auto-approved (below ${approvalThreshold.toLocaleString('en-US', { minimumFractionDigits: 2 })} — no buyer sign-off needed)
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">
+                    Requires buyer approval (${approvalThreshold.toLocaleString('en-US', { minimumFractionDigits: 2 })}+)
+                  </span>
+                )}
+              </div>
+            </div>
             <span className="text-3xl font-bold text-accent-deep">
               ${totalCost.toFixed(2)}
             </span>

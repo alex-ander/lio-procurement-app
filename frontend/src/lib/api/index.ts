@@ -47,6 +47,8 @@ export interface MyOrganization {
 // Request fields an org may optionally mark as required (see backend settings).
 export type ConfigurableRequiredField = 'vat_id' | 'department';
 
+export const DEFAULT_APPROVAL_THRESHOLD = 2000;
+
 export interface CommodityClassificationRule {
   pattern: string;
   commodity_group_id: number;
@@ -55,6 +57,7 @@ export interface CommodityClassificationRule {
 
 export interface OrganizationSettings {
   required_fields: ConfigurableRequiredField[];
+  approval_threshold?: number;
   commodity_rules?: CommodityClassificationRule[];
   accounting_guidelines?: string;
 }
@@ -201,6 +204,7 @@ export interface RequestActivity {
     | 'status_changed'
     | 'approved'
     | 'rejected'
+    | 'approval_reset'
     | 'document_attached'
     | 'catalog_article_applied';
   summary: string;
@@ -302,7 +306,7 @@ export const organizations = {
     return apiFetch('/organizations/me/settings');
   },
 
-  updateSettings(settings: OrganizationSettings): Promise<OrganizationSettings> {
+  updateSettings(settings: Partial<OrganizationSettings>): Promise<OrganizationSettings> {
     return apiFetch('/organizations/me/settings', { method: 'PATCH', body: settings });
   },
 };

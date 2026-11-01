@@ -17,6 +17,7 @@ from app.models import (
     RequestActivity,
     RequestDocument,
 )
+from app.schemas.organizations import DEFAULT_APPROVAL_THRESHOLD
 from app.schemas.requests import (
     ApplyCatalogArticleIn,
     ApprovalDecision,
@@ -188,6 +189,15 @@ def _enforce_required_fields(
         )
 
 
+def _get_approval_threshold(db: Session, organization_id: uuid.UUID) -> float:
+    """Return the organization's auto-approval threshold (defaults to $2,000)."""
+    org = db.get(Organization, organization_id)
+    raw = (org.settings or {}).get("approval_threshold") if org else None
+    if raw is None:
+        return DEFAULT_APPROVAL_THRESHOLD
+    return float(raw)
+
+
 def _log_activity(
     db: Session,
     request_id: uuid.UUID,
@@ -294,6 +304,8 @@ def create_request(
     order_lines, effective_total = _build_order_lines_and_total(
         payload.order_lines, payload.total_cost, articles_by_id
     )
+    threshold = _get_approval_threshold(db, membership.organization_id)
+    auto_approved = float(effective_total) < threshold
 
     # Vendor fields are already cleaned up during extraction, so we can persist
     # them directly here.
@@ -309,11 +321,25 @@ def create_request(
         organization_id=membership.organization_id,
         created_by=membership.user_id,
         status="open",
+        approval_status="approved" if auto_approved else "pending",
+        approved_by=None,
+        approved_at=datetime.now(timezone.utc) if auto_approved else None,
     )
     request.order_lines = order_lines
     db.add(request)
     db.flush()
-    _log_activity(db, request.id, membership.user_id, "created", "Request created")
+    _log_activity(
+        db,
+        request.id,
+        membership.user_id,
+        "created",
+        (
+            f"Request created (auto-approved — below ${threshold:,.2f} threshold)"
+            if auto_approved
+            else "Request created"
+        ),
+        {"auto_approved": True, "approval_threshold": threshold} if auto_approved else None,
+    )
     db.commit()
 
     request = _get_org_request(db, request.id, membership.organization_id)
@@ -337,6 +363,7 @@ def update_request(
     new_lines, effective_total = _build_order_lines_and_total(
         payload.order_lines, payload.total_cost, articles_by_id
     )
+    threshold = _get_approval_threshold(db, membership.organization_id)
 
     changed = _changed_fields(request, payload, effective_total, new_lines)
 
@@ -361,6 +388,37 @@ def update_request(
             f"Updated {', '.join(labels)}",
             {"changed_fields": changed},
         )
+
+    # Re-evaluate approval status when total_cost crosses the threshold.
+    if float(effective_total) < threshold and request.approval_status == "pending":
+        request.approval_status = "approved"
+        request.approved_by = None
+        request.approved_at = datetime.now(timezone.utc)
+        _log_activity(
+            db,
+            request.id,
+            membership.user_id,
+            "approved",
+            f"Request auto-approved (below ${threshold:,.2f} threshold)",
+            {"auto_approved": True, "approval_threshold": threshold},
+        )
+    elif (
+        float(effective_total) >= threshold
+        and request.approval_status == "approved"
+        and (request.approved_by is None or "total_cost" in changed)
+    ):
+        request.approval_status = "pending"
+        request.approved_by = None
+        request.approved_at = None
+        _log_activity(
+            db,
+            request.id,
+            membership.user_id,
+            "approval_reset",
+            f"Approval required (total ${float(effective_total):,.2f} meets or exceeds ${threshold:,.2f} threshold)",
+            {"approval_threshold": threshold},
+        )
+
     db.commit()
 
     request = _get_org_request(db, request_id, membership.organization_id)
@@ -441,6 +499,38 @@ def apply_catalog_article_to_line(
             "savings": savings,
         },
     )
+
+    threshold = _get_approval_threshold(db, membership.organization_id)
+    new_request_total = float(request.total_cost or 0)
+    if new_request_total < threshold and request.approval_status == "pending":
+        request.approval_status = "approved"
+        request.approved_by = None
+        request.approved_at = datetime.now(timezone.utc)
+        _log_activity(
+            db,
+            request.id,
+            membership.user_id,
+            "approved",
+            f"Request auto-approved (below ${threshold:,.2f} threshold)",
+            {"auto_approved": True, "approval_threshold": threshold},
+        )
+    elif (
+        new_request_total >= threshold
+        and request.approval_status == "approved"
+        and request.approved_by is None
+    ):
+        request.approval_status = "pending"
+        request.approved_by = None
+        request.approved_at = None
+        _log_activity(
+            db,
+            request.id,
+            membership.user_id,
+            "approval_reset",
+            f"Approval required (total ${new_request_total:,.2f} meets or exceeds ${threshold:,.2f} threshold)",
+            {"approval_threshold": threshold},
+        )
+
     db.commit()
 
     request = _get_org_request(db, request_id, membership.organization_id)

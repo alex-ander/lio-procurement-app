@@ -419,9 +419,9 @@ def test_activity_log_and_document():
     payload = {
         "requestorName": "Alex Admin", "titleShortDescription": "Chairs",
         "vendorName": "FurnitureCo", "vatId": "12-0000001", "commodityGroupId": 15,
-        "totalCost": 500.0, "department": "Ops",
+        "totalCost": 2500.0, "department": "Ops",
         "orderLines": [
-            {"positionDescription": "Chair", "unitPrice": 250, "amount": 2, "unit": "pc", "totalPrice": 500}
+            {"positionDescription": "Chair", "unitPrice": 250, "amount": 10, "unit": "pc", "totalPrice": 2500}
         ],
     }
     rid = client.post("/requests", json=payload, headers=_auth(admin)).json()["id"]
@@ -429,14 +429,14 @@ def test_activity_log_and_document():
     # edit two fields -> one 'updated' activity naming those fields
     updated = dict(payload)
     updated["title"] = "Office Chairs"
-    updated["totalCost"] = 600.0
+    updated["totalCost"] = 3000.0
     updated["orderLines"] = [
-        {"positionDescription": "Chair", "unitPrice": 300, "amount": 2, "unit": "pc", "totalPrice": 600}
+        {"positionDescription": "Chair", "unitPrice": 300, "amount": 10, "unit": "pc", "totalPrice": 3000}
     ]
     # RequestUpdate uses "title" (not titleShortDescription)
     updated = {
         "requestorName": "Alex Admin", "title": "Office Chairs", "vendorName": "FurnitureCo",
-        "vatId": "12-0000001", "commodityGroupId": 15, "totalCost": 600.0, "department": "Ops",
+        "vatId": "12-0000001", "commodityGroupId": 15, "totalCost": 3000.0, "department": "Ops",
         "orderLines": updated["orderLines"],
     }
     r = client.put(f"/requests/{rid}", json=updated, headers=_auth(admin))
@@ -719,6 +719,120 @@ def test_approval_flow_with_roles():
 
     # cleanup: remove the demo-org requests this test created
     for rid in (request_id, second_id):
+        client.delete(f"/requests/{rid}", headers=_auth(admin))
+
+
+def test_auto_approval_below_threshold():
+    requester = _signin("requester@acme.com")
+    buyer = _signin("buyer@acme.com")
+    admin = _signin("admin@acme.com")
+
+    # 1. Request strictly below $2,000 is auto-approved upon creation
+    sub_2k_payload = {
+        "requestorName": "Rene Requester",
+        "titleShortDescription": "Monitors",
+        "vendorName": "TechSupply",
+        "vatId": "99-9999999",
+        "commodityGroupId": 29,
+        "totalCost": 1999.99,
+        "department": "Engineering",
+        "orderLines": [
+            {"positionDescription": "Monitor", "unitPrice": 1999.99, "amount": 1, "unit": "pc", "totalPrice": 1999.99}
+        ],
+    }
+    r = client.post("/requests", json=sub_2k_payload, headers=_auth(requester))
+    assert r.status_code == 201, r.text
+    sub_2k_id = r.json()["id"]
+    assert r.json()["approval_status"] == "approved"
+    assert r.json()["approved_by"] is None
+    assert r.json()["approved_at"] is not None
+
+    # Already auto-approved -> buyer sign-off not needed (409 if attempted)
+    r_dec = client.patch(
+        f"/requests/{sub_2k_id}/approval",
+        json={"decision": "approved"},
+        headers=_auth(buyer),
+    )
+    assert r_dec.status_code == 409
+
+    # 2. Request at $2,000.00 requires buyer/admin approval
+    at_2k_payload = dict(
+        sub_2k_payload,
+        totalCost=2000.0,
+        orderLines=[
+            {"positionDescription": "Monitor", "unitPrice": 1000.0, "amount": 2, "unit": "pc", "totalPrice": 2000.0}
+        ],
+    )
+    r = client.post("/requests", json=at_2k_payload, headers=_auth(requester))
+    assert r.status_code == 201, r.text
+    at_2k_id = r.json()["id"]
+    assert r.json()["approval_status"] == "pending"
+    assert r.json()["approved_by"] is None
+    assert r.json()["approved_at"] is None
+
+    # 3. Editing a pending >= $2,000 request down below $2,000 auto-approves it
+    r_down = client.put(
+        f"/requests/{at_2k_id}",
+        json={
+            "requestorName": "Rene Requester",
+            "title": "Monitors",
+            "vendorName": "TechSupply",
+            "vatId": "99-9999999",
+            "commodityGroupId": 29,
+            "totalCost": 1500.0,
+            "department": "Engineering",
+            "orderLines": [
+                {"positionDescription": "Monitor", "unitPrice": 750.0, "amount": 2, "unit": "pc", "totalPrice": 1500.0}
+            ],
+        },
+        headers=_auth(requester),
+    )
+    assert r_down.status_code == 200, r_down.text
+    assert r_down.json()["approval_status"] == "approved"
+    assert r_down.json()["approved_at"] is not None
+
+    # 4. Editing an auto-approved request to >= $2,000 resets approval_status to pending
+    r_up = client.put(
+        f"/requests/{sub_2k_id}",
+        json={
+            "requestorName": "Rene Requester",
+            "title": "Monitors",
+            "vendorName": "TechSupply",
+            "vatId": "99-9999999",
+            "commodityGroupId": 29,
+            "totalCost": 2500.0,
+            "department": "Engineering",
+            "orderLines": [
+                {"positionDescription": "Monitor", "unitPrice": 1250.0, "amount": 2, "unit": "pc", "totalPrice": 2500.0}
+            ],
+        },
+        headers=_auth(requester),
+    )
+    assert r_up.status_code == 200, r_up.text
+    assert r_up.json()["approval_status"] == "pending"
+    assert r_up.json()["approved_at"] is None
+
+    # 5. Org admin can customize approval_threshold; pending requests below new threshold auto-approve
+    r_thresh = client.patch(
+        "/organizations/me/settings",
+        json={"approval_threshold": 3000.0},
+        headers=_auth(admin),
+    )
+    assert r_thresh.status_code == 200, r_thresh.text
+    assert r_thresh.json()["approval_threshold"] == 3000.0
+
+    # sub_2k_id (now $2,500) was pending and is below $3,000, so it is now auto-approved
+    r_check = client.get(f"/requests/{sub_2k_id}", headers=_auth(requester))
+    assert r_check.status_code == 200
+    assert r_check.json()["approval_status"] == "approved"
+
+    # Reset org settings and clean up
+    client.patch(
+        "/organizations/me/settings",
+        json={"approval_threshold": None},
+        headers=_auth(admin),
+    )
+    for rid in (sub_2k_id, at_2k_id):
         client.delete(f"/requests/{rid}", headers=_auth(admin))
 
 
@@ -1312,6 +1426,7 @@ if __name__ == "__main__":
     test_seed_is_idempotent()
     test_demo_user_can_sign_in()
     test_approval_flow_with_roles()
+    test_auto_approval_below_threshold()
     test_org_settings_required_fields()
     test_org_settings_admin_only()
     test_catalog_article_suggestions_and_negotiated_pricing()

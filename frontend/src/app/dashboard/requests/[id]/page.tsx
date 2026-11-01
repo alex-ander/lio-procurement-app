@@ -215,7 +215,9 @@ export default function RequestDetailPage() {
               {titleCase(request.status)}
             </span>
             <span className={`inline-flex px-2.5 py-1 text-xs font-semibold rounded-full ${APPROVAL_BADGE[request.approval_status]}`}>
-              {titleCase(request.approval_status)}
+              {request.approval_status === 'approved' && !request.approved_by
+                ? 'Auto-Approved'
+                : titleCase(request.approval_status)}
             </span>
           </div>
         </div>

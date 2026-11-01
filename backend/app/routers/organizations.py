@@ -13,10 +13,13 @@ from app.models import (
     Organization,
     OrganizationInvite,
     OrganizationMember,
+    ProcurementRequest,
     Profile,
+    RequestActivity,
     User,
 )
 from app.schemas.organizations import (
+    DEFAULT_APPROVAL_THRESHOLD,
     InviteAccept,
     InviteCreate,
     InviteOut,
@@ -138,6 +141,38 @@ def update_settings(
             merged[key] = value
 
     org.settings = merged
+
+    if "approval_threshold" in updates:
+        raw_threshold = merged.get("approval_threshold")
+        effective_threshold = (
+            DEFAULT_APPROVAL_THRESHOLD if raw_threshold is None else float(raw_threshold)
+        )
+        if effective_threshold > 0:
+            pending_below = db.scalars(
+                select(ProcurementRequest).where(
+                    ProcurementRequest.organization_id == membership.organization_id,
+                    ProcurementRequest.approval_status == "pending",
+                    ProcurementRequest.total_cost < effective_threshold,
+                )
+            ).all()
+            now = datetime.now(timezone.utc)
+            for req in pending_below:
+                req.approval_status = "approved"
+                req.approved_by = None
+                req.approved_at = now
+                db.add(
+                    RequestActivity(
+                        request_id=req.id,
+                        actor_id=membership.user_id,
+                        action="approved",
+                        summary=f"Request auto-approved (below ${effective_threshold:,.2f} threshold)",
+                        detail={
+                            "auto_approved": True,
+                            "approval_threshold": effective_threshold,
+                        },
+                    )
+                )
+
     db.commit()
     return OrganizationSettings(**org.settings)
 

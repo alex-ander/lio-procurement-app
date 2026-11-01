@@ -28,6 +28,7 @@ export default function OrganizationPage() {
   const [organizationName, setOrganizationName] = useState<string>('');
   const [role, setRole] = useState<api.MemberRole | null>(null);
   const [requiredFields, setRequiredFields] = useState<api.ConfigurableRequiredField[]>([]);
+  const [approvalThreshold, setApprovalThreshold] = useState<number>(api.DEFAULT_APPROVAL_THRESHOLD);
   const [accountingGuidelines, setAccountingGuidelines] = useState('');
   const [commodityRules, setCommodityRules] = useState<api.CommodityClassificationRule[]>([]);
   const [newRulePattern, setNewRulePattern] = useState('');
@@ -54,6 +55,7 @@ export default function OrganizationPage() {
       setMembers(result.members);
       setInvites(result.invites);
       setRequiredFields(settings.required_fields);
+      setApprovalThreshold(settings.approval_threshold ?? api.DEFAULT_APPROVAL_THRESHOLD);
       setAccountingGuidelines(settings.accounting_guidelines || '');
       setCommodityRules(settings.commodity_rules || []);
     } catch (err) {
@@ -117,6 +119,28 @@ export default function OrganizationPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update settings');
       await loadOrganization(); // revert to server state
+    }
+    setSavingSettings(false);
+  };
+
+  const saveApprovalThreshold = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const numeric = Math.max(0, Number(approvalThreshold) || 0);
+    setApprovalThreshold(numeric);
+    setSavingSettings(true);
+    setError('');
+    setSuccess('');
+    try {
+      const saved = await api.organizations.updateSettings({
+        required_fields: requiredFields,
+        approval_threshold: numeric,
+      });
+      setRequiredFields(saved.required_fields);
+      setApprovalThreshold(saved.approval_threshold ?? api.DEFAULT_APPROVAL_THRESHOLD);
+      setSuccess('Approval threshold updated');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update approval threshold');
+      await loadOrganization();
     }
     setSavingSettings(false);
   };
@@ -325,30 +349,53 @@ export default function OrganizationPage() {
 
       {tab === 'settings' && (
         <div className="space-y-6">
-          <div className="lio-card p-6">
-            <h2 className="text-xl font-semibold tracking-tight text-ink">Request Settings</h2>
-            <p className="text-sm text-ink/55 mt-1 mb-4">
-              Choose which optional fields are required when creating a request.
-            </p>
-            <div className="space-y-2">
-              {REQUIRABLE_FIELDS.map((field) => {
-                const checked = requiredFields.includes(field.key);
-                return (
-                  <label
-                    key={field.key}
-                    className="flex items-center gap-3 rounded-xl border border-line px-4 py-3 cursor-pointer hover:bg-ink-800/[0.02]"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={savingSettings}
-                      onChange={() => toggleRequiredField(field.key)}
-                      className="h-4 w-4 accent-accent-deep"
-                    />
-                    <span className="text-sm text-ink">Require {field.label}</span>
-                  </label>
-                );
-              })}
+          <div className="lio-card p-6 space-y-6">
+            <div>
+              <h2 className="text-xl font-semibold tracking-tight text-ink">Request Settings</h2>
+              <p className="text-sm text-ink/55 mt-1 mb-4">
+                Choose which optional fields are required when creating a request.
+              </p>
+              <div className="space-y-2">
+                {REQUIRABLE_FIELDS.map((field) => {
+                  const checked = requiredFields.includes(field.key);
+                  return (
+                    <label
+                      key={field.key}
+                      className="flex items-center gap-3 rounded-xl border border-line px-4 py-3 cursor-pointer hover:bg-ink-800/[0.02]"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={savingSettings}
+                        onChange={() => toggleRequiredField(field.key)}
+                        className="h-4 w-4 accent-accent-deep"
+                      />
+                      <span className="text-sm text-ink">Require {field.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="border-t border-line pt-5">
+              <h3 className="text-base font-semibold text-ink">Auto-Approval Threshold ($)</h3>
+              <p className="text-sm text-ink/55 mt-1 mb-3">
+                Requests with a total cost strictly below this amount are automatically approved without requiring buyer sign-off.
+              </p>
+              <form onSubmit={saveApprovalThreshold} className="flex flex-col sm:flex-row items-stretch sm:items-end gap-3 max-w-md">
+                <Input
+                  type="number"
+                  min={0}
+                  step="50"
+                  value={approvalThreshold}
+                  onChange={(e) => setApprovalThreshold(Math.max(0, parseFloat(e.target.value) || 0))}
+                  disabled={savingSettings}
+                  className="flex-1"
+                />
+                <Button type="submit" size="sm" loading={savingSettings} disabled={savingSettings} className="h-11">
+                  Save Threshold
+                </Button>
+              </form>
             </div>
           </div>
 
