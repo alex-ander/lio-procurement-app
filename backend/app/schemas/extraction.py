@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class PdfParseResponse(BaseModel):
@@ -20,6 +20,16 @@ class OrderLineData(BaseModel):
     unit: str = ""
     total_price: float = Field(default=0, alias="totalPrice")
 
+    @field_validator("position_description", "unit", mode="before")
+    @classmethod
+    def _null_str_to_empty(cls, v: object) -> object:
+        return "" if v is None else v
+
+    @field_validator("unit_price", "amount", "total_price", mode="before")
+    @classmethod
+    def _null_num_to_zero(cls, v: object) -> object:
+        return 0.0 if v is None else v
+
 
 class ExtractedVendorData(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -32,6 +42,21 @@ class ExtractedVendorData(BaseModel):
     total_cost: float = Field(default=0, alias="totalCost")
     commodity_group_id: int | None = Field(default=None, alias="commodityGroupId")
     commodity_group_name: str | None = Field(default=None, alias="commodityGroupName")
+
+    @field_validator("title", "vendor_name", "vat_id", "department", mode="before")
+    @classmethod
+    def _null_str_to_empty(cls, v: object) -> object:
+        return "" if v is None else v
+
+    @field_validator("total_cost", mode="before")
+    @classmethod
+    def _null_num_to_zero(cls, v: object) -> object:
+        return 0.0 if v is None else v
+
+    @field_validator("order_lines", mode="before")
+    @classmethod
+    def _null_list_to_empty(cls, v: object) -> object:
+        return [] if v is None else v
 
 
 class ExtractionResponse(BaseModel):
