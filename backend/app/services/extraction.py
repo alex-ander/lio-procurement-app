@@ -20,56 +20,69 @@ SYSTEM_PROMPT = (
 
 
 def _build_prompt(pdf_text: str, commodity_groups_list: str) -> str:
-    return f"""You are a data extraction and classification specialist. Extract procurement/vendor offer information from the following US document text AND classify it into the appropriate commodity group.
-
-Document Text:
-{pdf_text}
-
-Please extract the following information:
-1. Title/Short Description (A brief summary of what this procurement is for - e.g., "Office Equipment Purchase", "Software Licenses", etc.)
-2. Vendor Name (Vendor/Supplier/Seller/Company name)
-3. Tax ID (Employer Identification Number/EIN/Federal Tax ID/TIN/VAT ID)
-4. Department/Customer (Department/Customer/Bill To/Customer name)
-5. Order Lines/Items (All line items with):
-   - Position Description (Description/Product/Item/Article)
-   - Unit Price (Unit Price/Price/Rate/Price per unit)
-   - Amount (Qty/Quantity/Count)
-   - Unit (Unit/UoM - e.g., "licenses", "pieces", "ea.", "items")
-   - Total Price (Total/Ext. Price/Amount)
-6. Total Cost (Grand Total/Total Cost/Total Offer Cost)
-7. Commodity Group Classification - Select the SINGLE most appropriate commodity group from the list below
+    return f"""You are a data extraction and classification specialist. Extract procurement/vendor offer information from the following US business quote text AND classify it into the appropriate commodity group.
 
 Available Commodity Groups (ID | Category | Name):
 {commodity_groups_list}
 
-IMPORTANT INSTRUCTIONS:
-- For the title, create a SHORT (2-5 words) description based on the main items being purchased
-- Extract ALL line items, even if there are many
-- For unit prices and totals, extract only the numeric value (remove currency symbols)
-- For the unit field, write out abbreviations in plain English (e.g., "ea." -> "pieces", "lic." -> "licenses")
-- Be careful with US number formatting (e.g., "1,438.00" = 1438.00)
-- For classification, consider the PRIMARY nature and purpose of the items:
-  * Branded office decor/furniture → Office Equipment (15)
-  * Traditional promotional items (brochures, giveaways, banners) → Promotional Materials (43)
-  * Software/IT products → Software (31) or IT Services (30)
-  * If genuinely uncertain, set commodityGroupId to null
+Document Text:
+{pdf_text}
 
-Return ONLY valid JSON in this exact format (no markdown, no code blocks):
+CRITICAL EXTRACTION RULES:
+
+1. DISTINGUISHING VENDOR (SELLER) vs. DEPARTMENT / CUSTOMER (BUYER):
+   - Window-Envelope Layout Warning: Many quotes have a 1-line sender return address (`Seller Name | Street | City`) directly above a 3-4 line recipient mailing address (`Buyer Company \n Contact Person \n Street \n City`). The multi-line mailing address block is the **BUYER/RECIPIENT** (`department`), NEVER the `vendorName`.
+   - How to identify `vendorName` (the Seller / Quote Issuer):
+     * Look at the 1-line return address above the recipient block, the letterhead/logo, the closing signature (`Best regards, ...` / `Sincerely, ...`), the Sales Rep's email domain (e.g., `rep@vendor-domain.example`), the phrase `"Thank you for your inquiry at <Vendor>"`, and the footer block containing the EIN / Seller's Permit / bank routing details.
+   - How to identify `department` (the Buyer / Customer / Recipient):
+     * Look at `"Attn: <Department>"` (e.g., `"Purchasing / Engineering"`), `"Prepared for:"`, `"Quote recipient"`, or the multi-line recipient address block associated with `"Customer No."`.
+     * If an explicit department (`Attn: ...`) is present, use that department; otherwise use the recipient company/contact from the recipient address block.
+     * `vendorName` and `department` must NEVER be the same company and must NEVER be swapped.
+
+2. TAX ID (`vatId`):
+   - Extract the Seller's Employer Identification Number (`EIN` / `Tax ID`, e.g., `"85-3252405"` or `"94 1985704"`). Do NOT use the Seller's Permit number, LLC number, or Customer number.
+   - If no EIN / Tax ID is present anywhere in the document, return `""` (empty string) for `"vatId"`.
+
+3. ORDER LINES (`orderLines`) & ALTERNATIVE ITEMS:
+   - First identify `netItemsSubtotal`: the document's net items subtotal before shipping and tax (`Page subtotal` / `Items subtotal (net)` / `Items (net)` / `Net total` / `Subtotal`).
+   - Extract ONLY the active line items whose `totalPrice` values sum up to `netItemsSubtotal`.
+   - STRICTLY EXCLUDE alternative or optional items: Any row preceded by a section header like `"Alternative: ..."` (e.g., row `4 Alternative: vertical logo` followed by row `5 ... (Alt.)`), any row containing `"(Alt.)"` or `"Alternative to the preceding item"`, or any row whose Total column is `"U.P."` is an optional alternative NOT included in `netItemsSubtotal` — DO NOT include it in `orderLines`.
+   - If including a row would make the sum of `orderLines[].totalPrice` exceed `netItemsSubtotal`, that row is an alternative item and MUST be excluded.
+   - EXCLUDE section header rows: Ignore numbering-only category header rows that have no quantity and no price (e.g., `1  Moss Art Panel...` when row `2` is the actual priced item, or `1. Moss art panel` above `1.1`).
+   - Do NOT confuse the leftmost `Item` / `Pos` row number (`1`, `2`, `3`, `1.1`, `1.2`) with the quantity (`amount`). The quantity (`amount`) is the number right next to the unit of measure (e.g., `1.00 ea.`, `13.78 sq ft`, `15.75 lin ft`).
+   - Do NOT include summary-block shipping, sales tax, or eWaste fees as `orderLines` (unless delivery/shipping is an explicit numbered row inside the main items table with an Item number like `1.2` or `2`).
+   - Write out unit abbreviations in plain English (e.g., `"ea."` -> `"pieces"`, `"sq ft"` -> `"square feet"`, `"lin ft"` -> `"linear feet"`).
+
+4. TOTAL COST (`totalCost`):
+   - Extract the final `Grand total` / `Total (gross)` / `Total (USD)` (including shipping and taxes) as a numeric value.
+
+5. COMMODITY GROUP CLASSIFICATION:
+   - Select the SINGLE most appropriate commodity group from the Available Commodity Groups list above:
+     * Branded office decor / moss walls / interior plantscaping / furniture → `15` (`Office Equipment`)
+     * Laptops / computers / IT hardware → `29` (`Hardware`)
+     * Industrial / manufacturing / grinding machinery → `45` (`Production Machinery`)
+     * Promotional giveaways / brochures / banners → `43` (`Promotional Materials`)
+     * Software licenses → `31` (`Software`) or `30` (`IT Services`)
+
+Return ONLY valid JSON in this exact field order (fill in the evidence and subtotal fields first so `vendorName`, `department`, and `orderLines` are verified before they are emitted):
 {{
-  "title": "Short description of procurement",
-  "vendorName": "Company Name",
+  "issuerEvidence": "Sales rep email domain, closing signature company, and footer company next to EIN",
+  "recipientEvidence": "Company/department in the recipient mailing block or Attn/Prepared-for section",
+  "title": "Short 2-5 word description",
   "vatId": "12-3456789",
-  "department": "Department Name",
+  "vendorName": "Seller Company Name",
+  "department": "Buyer Department or Recipient Name",
+  "netItemsSubtotal": 150.00,
   "orderLines": [
     {{
       "positionDescription": "Item description",
       "unitPrice": 150.00,
-      "amount": 10,
-      "unit": "licenses",
-      "totalPrice": 1500.00
+      "amount": 1.0,
+      "unit": "pieces",
+      "totalPrice": 150.00
     }}
   ],
-  "totalCost": 1500.00,
+  "totalCost": 150.00,
   "commodityGroupId": 15,
   "commodityGroupName": "Office Equipment"
 }}"""
@@ -100,40 +113,36 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
             error="OPENAI_API_KEY is not configured on the server",
         )
 
-    commodity_groups = list(
-        db.scalars(select(CommodityGroup).order_by(CommodityGroup.id))
-    )
+    commodity_groups = list(db.scalars(select(CommodityGroup).order_by(CommodityGroup.id)))
     if not commodity_groups:
         return ExtractionResponse(
             success=False,
             error="Failed to load commodity groups for classification",
         )
 
-    # Give the model the full commodity catalog so it has complete context to
-    # pick the most accurate match in a single pass.
-    commodity_groups_list = "\n".join(
-        f"{g.id} | {g.category} | {g.name}" for g in commodity_groups
-    )
+    # Pass the canonical 50 commodity groups (ids 1-50) to avoid diluting the prompt
+    # with 2,000 synthetic variant rows; fall back to the first 50 if custom ids are used.
+    core_groups = [g for g in commodity_groups if g.id <= 50] or commodity_groups[:50]
+    commodity_groups_list = "\n".join(f"{g.id} | {g.category} | {g.name}" for g in core_groups)
 
     try:
         client = OpenAI(api_key=settings.openai_api_key)
         response = client.chat.completions.create(
             model=settings.openai_model,
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": _build_prompt(pdf_text, commodity_groups_list)},
             ],
             max_completion_tokens=4000,
-            temperature=0.3,
+            temperature=0.0,
         )
 
         content = response.choices[0].message.content
         if not content:
             return ExtractionResponse(success=False, error="Empty response from AI")
 
-        extracted = ExtractedVendorData.model_validate(
-            json.loads(_strip_markdown_fences(content))
-        )
+        extracted = ExtractedVendorData.model_validate(json.loads(_strip_markdown_fences(content)))
     except Exception as exc:  # noqa: BLE001 — mirror the original catch-all
         logger.exception("Error extracting vendor data")
         return ExtractionResponse(success=False, error=str(exc))
@@ -159,9 +168,7 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
     if extracted.commodity_group_id is not None:
         valid_ids = {g.id for g in commodity_groups}
         if extracted.commodity_group_id not in valid_ids:
-            logger.warning(
-                "Invalid commodity group ID returned: %s", extracted.commodity_group_id
-            )
+            logger.warning("Invalid commodity group ID returned: %s", extracted.commodity_group_id)
             extracted.commodity_group_id = None
             extracted.commodity_group_name = None
             if "Commodity Group" not in missing_fields:
