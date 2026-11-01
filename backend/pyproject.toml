@@ -31,5 +31,10 @@ target-version = "py311"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
 [tool.setuptools.packages.find]
 include = ["app*"]
