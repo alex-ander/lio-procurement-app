@@ -1,1 +1,19 @@
+# OS-generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE configuration
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Logs & Environment
+*.log
 .env
+.env.local
+
+# Monorepo / Package Manager roots (if applicable)
+node_modules/
+.turbo/
