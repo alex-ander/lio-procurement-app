@@ -459,10 +459,10 @@ def test_pdf_parse_quote_files(filename: str):
     reason="OPENAI_API_KEY is required for live LLM extraction tests",
 )
 @pytest.mark.parametrize("filename", list(EXPECTED_QUOTES.keys()))
-def test_pdf_extraction_matches_ground_truth(filename: str):
+def test_pdf_extraction_matches_ground_truth(filename: str, monkeypatch: pytest.MonkeyPatch):
     """End-to-end test: ``POST /pdf/parse`` -> ``POST /extraction`` compared with PDF ground truth."""
     if not settings.openai_api_key and os.environ.get("OPENAI_API_KEY"):
-        settings.openai_api_key = os.environ["OPENAI_API_KEY"]
+        monkeypatch.setattr(settings, "openai_api_key", os.environ["OPENAI_API_KEY"])
 
     headers = _get_auth_headers()
     pdf_path = QUOTES_DIR / filename

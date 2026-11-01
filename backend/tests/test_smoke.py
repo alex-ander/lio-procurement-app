@@ -480,20 +480,27 @@ def test_activity_log_and_document():
 
 
 def test_extraction_without_api_key():
+    from app.core.config import settings
+
     r = client.post("/auth/signup", json={"email": "ex@example.com", "password": "secret123"})
     token = r.json()["access_token"]
 
-    r = client.post("/extraction", json={"text": "Quote No. 123"}, headers=_auth(token))
-    assert r.status_code == 200
-    body = r.json()
-    # Without OPENAI_API_KEY configured the endpoint reports a clean failure
-    # envelope rather than an HTTP error.
-    assert body["success"] is False
-    assert "OPENAI_API_KEY" in body["error"]
+    prev_key = settings.openai_api_key
+    settings.openai_api_key = None
+    try:
+        r = client.post("/extraction", json={"text": "Quote No. 123"}, headers=_auth(token))
+        assert r.status_code == 200
+        body = r.json()
+        # Without OPENAI_API_KEY configured the endpoint reports a clean failure
+        # envelope rather than an HTTP error.
+        assert body["success"] is False
+        assert "OPENAI_API_KEY" in body["error"]
 
-    # empty text
-    r = client.post("/extraction", json={"text": "  "}, headers=_auth(token))
-    assert r.json()["success"] is False
+        # empty text
+        r = client.post("/extraction", json={"text": "  "}, headers=_auth(token))
+        assert r.json()["success"] is False
+    finally:
+        settings.openai_api_key = prev_key
 
 
 def test_commodity_groups_expanded():
