@@ -28,20 +28,57 @@ services:
         condition: service_healthy
     ports:
       - "7200:7200"
+    develop:
+      watch:
+        - action: sync
+          path: ./backend/app
+          target: /app/app
+          ignore:
+            - __pycache__/
+        - action: sync+restart
+          path: ./backend/alembic
+          target: /app/alembic
+          ignore:
+            - __pycache__/
+        - action: rebuild
+          path: ./backend/pyproject.toml
 
   frontend:
     build:
       context: ./frontend
+      target: dev
       args:
         # Inlined into the client bundle at build time; the browser calls the
         # backend directly, so this must be reachable from the host.
         NEXT_PUBLIC_API_URL: http://localhost:7200
     environment:
       PORT: 3200
+      NEXT_PUBLIC_API_URL: http://localhost:7200
     depends_on:
       - backend
     ports:
       - "3200:3200"
+    develop:
+      watch:
+        - action: sync
+          path: ./frontend/src
+          target: /app/src
+        - action: sync
+          path: ./frontend/public
+          target: /app/public
+        - action: sync+restart
+          path: ./frontend/next.config.ts
+          target: /app/next.config.ts
+        - action: sync+restart
+          path: ./frontend/tsconfig.json
+          target: /app/tsconfig.json
+        - action: sync+restart
+          path: ./frontend/postcss.config.mjs
+          target: /app/postcss.config.mjs
+        - action: rebuild
+          path: ./frontend/package.json
+        - action: rebuild
+          path: ./frontend/package-lock.json
 
 volumes:
   postgres_data:

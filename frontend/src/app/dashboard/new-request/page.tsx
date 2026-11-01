@@ -1,18 +1,22 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useMutation } from '@tanstack/react-query';
 import * as api from '@/lib/api';
+import type { ArticleSuggestion, CatalogArticle } from '@/types/database';
 import { useCommodityGroups } from '@/lib/hooks/useCommodityGroups';
 import { Button, Input, Alert, Loader } from '@/components/base';
 
-interface OrderLine {
+interface OrderLineForm {
   positionDescription: string;
   unitPrice: number;
   amount: number;
   unit: string;
   totalPrice: number;
+  articleId?: string | null;
+  appliedArticle?: CatalogArticle | null;
+  suggestedArticles?: ArticleSuggestion[];
 }
 
 export default function NewRequestPage() {
@@ -26,8 +30,9 @@ export default function NewRequestPage() {
   const [vatId, setVatId] = useState('');
   const [department, setDepartment] = useState('');
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
-  const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
+  const [orderLines, setOrderLines] = useState<OrderLineForm[]>([]);
   const [totalCost, setTotalCost] = useState<number>(0);
+  const [approvalThreshold, setApprovalThreshold] = useState<number>(api.DEFAULT_APPROVAL_THRESHOLD);
 
   // UI state
   const [file, setFile] = useState<File | null>(null);
@@ -35,6 +40,63 @@ export default function NewRequestPage() {
   const [success, setSuccess] = useState('');
   const [warning, setWarning] = useState('');
   const [extracting, setExtracting] = useState(false);
+
+  // Per-line debounce timers for live catalog suggestions
+  const suggestTimersRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
+
+  useEffect(() => {
+    api.organizations
+      .getSettings()
+      .then((s) => {
+        setApprovalThreshold(s.approval_threshold ?? api.DEFAULT_APPROVAL_THRESHOLD);
+      })
+      .catch(() => {
+        // Non-fatal; default threshold applies
+      });
+    const timers = suggestTimersRef.current;
+    return () => {
+      Object.values(timers).forEach(clearTimeout);
+    };
+  }, []);
+
+  const scheduleLineSuggestionFetch = (
+    index: number,
+    line: OrderLineForm,
+    currentTitle: string,
+    currentVendor: string
+  ) => {
+    if (suggestTimersRef.current[index]) {
+      clearTimeout(suggestTimersRef.current[index]);
+    }
+    const query = line.positionDescription.trim();
+    if (query.length < 3) {
+      return;
+    }
+    suggestTimersRef.current[index] = setTimeout(async () => {
+      try {
+        const suggestions = await api.articles.suggest({
+          q: query,
+          unit: line.unit || undefined,
+          amount: line.amount > 0 ? line.amount : 1,
+          unitPrice: line.unitPrice > 0 ? line.unitPrice : undefined,
+          totalPrice: line.totalPrice > 0 ? line.totalPrice : undefined,
+          title: currentTitle || undefined,
+          vendorName: currentVendor || undefined,
+          limit: 3,
+        });
+        setOrderLines((prev) => {
+          if (!prev[index] || prev[index].positionDescription.trim() !== query) {
+            return prev;
+          }
+          const next = [...prev];
+          next[index] = { ...next[index], suggestedArticles: suggestions };
+          return next;
+        });
+      } catch {
+        // Non-fatal if suggestion lookup fails
+      }
+    }, 350);
+  };
 
   // PDF parsing mutation
   const parsePDFMutation = useMutation({
@@ -69,21 +131,32 @@ export default function NewRequestPage() {
 
       // Step 2: Extract structured data AND classify commodity group in one AI call
       const extractionResult = await api.extraction.extract(pdfText);
-      
+
       if (!extractionResult.success || !extractionResult.data) {
         throw new Error(extractionResult.error || 'Failed to extract data');
       }
 
       const extracted = extractionResult.data;
 
-      // Step 3: Auto-fill form (including commodity group from extraction)
+      // Step 3: Auto-fill form (including commodity group and catalog suggestions from extraction)
       setTitle(extracted.title || '');
       setVendorName(extracted.vendorName || '');
       setVatId(extracted.vatId || '');
       setDepartment(extracted.department || '');
-      setOrderLines(extracted.orderLines || []);
+      setOrderLines(
+        (extracted.orderLines || []).map((l) => ({
+          positionDescription: l.positionDescription,
+          unitPrice: l.unitPrice,
+          amount: l.amount,
+          unit: l.unit,
+          totalPrice: l.totalPrice,
+          articleId: l.articleId ?? null,
+          appliedArticle: null,
+          suggestedArticles: l.suggestedArticles ?? [],
+        }))
+      );
       setTotalCost(extracted.totalCost || 0);
-      
+
       // Set commodity group (now included in extraction)
       if (extracted.commodityGroupId) {
         setCommodityGroupId(extracted.commodityGroupId);
@@ -96,7 +169,7 @@ export default function NewRequestPage() {
         );
       }
 
-      setSuccess('✓ PDF extracted successfully! Review and submit.');
+      setSuccess('✓ PDF extracted successfully! Review catalog matches and submit.');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       console.error('Extraction error:', err);
@@ -117,25 +190,91 @@ export default function NewRequestPage() {
         amount: 1,
         unit: '',
         totalPrice: 0,
+        articleId: null,
+        appliedArticle: null,
+        suggestedArticles: [],
       },
     ]);
   };
 
   // Update order line
-  const updateOrderLine = (index: number, field: keyof OrderLine, value: string | number) => {
+  const updateOrderLine = (
+    index: number,
+    field: 'positionDescription' | 'unitPrice' | 'amount' | 'unit',
+    value: string | number
+  ) => {
     const updated = [...orderLines];
-    updated[index] = { ...updated[index], [field]: value };
-    
+    const current = { ...updated[index], [field]: value };
+
+    // If user manually edits description or unit price, clear any locked catalog article
+    if (field === 'positionDescription' || field === 'unitPrice') {
+      current.articleId = null;
+      current.appliedArticle = null;
+    }
+
     // Auto-calculate total price
     if (field === 'unitPrice' || field === 'amount') {
-      updated[index].totalPrice = updated[index].unitPrice * updated[index].amount;
+      current.totalPrice = Math.round(current.unitPrice * current.amount * 100) / 100;
     }
-    
+
+    updated[index] = current;
     setOrderLines(updated);
-    
+
     // Update total cost
     const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+    setTotalCost(Math.round(newTotal * 100) / 100);
+
+    // Fetch updated catalog suggestions
+    scheduleLineSuggestionFetch(index, current, title, vendorName);
+  };
+
+  // Apply a suggested catalog article to an order line
+  const applyCatalogSuggestion = (index: number, suggestion: ArticleSuggestion) => {
+    const article = suggestion.article;
+    const negotiatedUnitPrice = Number(article.unit_price);
+    const updated = [...orderLines];
+    const target = updated[index];
+    const oldLineTotal = target.totalPrice;
+    const amount = target.amount > 0 ? target.amount : 1;
+    const newLineTotal = Math.round(negotiatedUnitPrice * amount * 100) / 100;
+
+    updated[index] = {
+      ...target,
+      positionDescription: article.description,
+      unitPrice: negotiatedUnitPrice,
+      unit: article.unit,
+      amount,
+      totalPrice: newLineTotal,
+      articleId: article.id,
+      appliedArticle: article,
+    };
+    setOrderLines(updated);
+
+    // Adjust totalCost by the line delta (preserving any shipping/tax difference from PDF quotes)
+    const sumOfNewLines = updated.reduce((sum, l) => sum + l.totalPrice, 0);
+    const adjustedTotal =
+      totalCost > 0
+        ? Math.max(0, Math.round((totalCost + (newLineTotal - oldLineTotal)) * 100) / 100)
+        : Math.round(sumOfNewLines * 100) / 100;
+    setTotalCost(adjustedTotal);
+
+    // Populate supplier details from the catalog agreement
+    if (article.supplier_name) {
+      setVendorName(article.supplier_name);
+    }
+    if (article.supplier_vat_id) {
+      setVatId(article.supplier_vat_id);
+    }
+  };
+
+  const unlinkCatalogArticle = (index: number) => {
+    const updated = [...orderLines];
+    updated[index] = {
+      ...updated[index],
+      articleId: null,
+      appliedArticle: null,
+    };
+    setOrderLines(updated);
   };
 
   // Remove order line
@@ -143,7 +282,7 @@ export default function NewRequestPage() {
     const updated = orderLines.filter((_, i) => i !== index);
     setOrderLines(updated);
     const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+    setTotalCost(Math.round(newTotal * 100) / 100);
   };
 
   // Submit form
@@ -153,7 +292,6 @@ export default function NewRequestPage() {
     setSuccess('');
     setWarning('');
 
-    // Validation with scroll to top on error
     if (!commodityGroupId) {
       setError('Please select a commodity group');
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -175,7 +313,14 @@ export default function NewRequestPage() {
         commodityGroupId: commodityGroupId,
         totalCost,
         department,
-        orderLines,
+        orderLines: orderLines.map((line) => ({
+          positionDescription: line.positionDescription,
+          unitPrice: line.unitPrice,
+          amount: line.amount,
+          unit: line.unit,
+          totalPrice: line.totalPrice,
+          articleId: line.articleId ?? null,
+        })),
       });
 
       // Attach the original PDF (if one was uploaded) so it shows on the detail page.
@@ -218,7 +363,7 @@ export default function NewRequestPage() {
         <div className="lio-card p-6">
           <h2 className="text-xl font-semibold tracking-tight text-ink mb-4">Upload Vendor Offer (Optional)</h2>
           <p className="text-sm text-gray-600 mb-4">
-            Upload a PDF to automatically extract vendor details and order items
+            Upload a PDF to automatically extract vendor details, order items, and matching catalog agreements
           </p>
 
           <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-accent-deep/50 transition-colors">
@@ -367,79 +512,191 @@ export default function NewRequestPage() {
             </div>
           ) : (
             <div className="space-y-4">
-              {orderLines.map((line, index) => (
-                <div key={index} className="border border-gray-200 rounded-lg p-4">
-                  <div className="flex items-start justify-between mb-4">
-                    <h3 className="text-sm font-medium text-gray-700">Line {index + 1}</h3>
-                    <button
-                      type="button"
-                      onClick={() => removeOrderLine(index)}
-                      className="text-red-600 hover:text-red-700 text-sm"
-                    >
-                      Remove
-                    </button>
-                  </div>
+              {orderLines.map((line, index) => {
+                const availableSuggestions = (line.suggestedArticles || []).filter(
+                  (s) => s.article.id !== line.articleId
+                );
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-                    <div className="lg:col-span-2">
+                return (
+                  <div key={index} className="border border-gray-200 rounded-lg p-4 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-medium text-gray-700">Line {index + 1}</h3>
+                        {line.appliedArticle && (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            ✓ Catalog Agreement: {line.appliedArticle.article_number}
+                            {line.appliedArticle.supplier_name
+                              ? ` · ${line.appliedArticle.supplier_name}`
+                              : ''}
+                            <button
+                              type="button"
+                              onClick={() => unlinkCatalogArticle(index)}
+                              className="ml-1 underline text-green-900 hover:text-green-700"
+                            >
+                              Unlink
+                            </button>
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => removeOrderLine(index)}
+                        className="text-red-600 hover:text-red-700 text-sm"
+                      >
+                        Remove
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+                      <div className="lg:col-span-2">
+                        <Input
+                          label="Description"
+                          value={line.positionDescription}
+                          onChange={(e) =>
+                            updateOrderLine(index, 'positionDescription', e.target.value)
+                          }
+                          required
+                          placeholder="Item description"
+                        />
+                      </div>
+
                       <Input
-                        label="Description"
-                        value={line.positionDescription}
+                        label="Unit Price ($)"
+                        type="number"
+                        step="0.01"
+                        value={line.unitPrice}
                         onChange={(e) =>
-                          updateOrderLine(index, 'positionDescription', e.target.value)
+                          updateOrderLine(index, 'unitPrice', parseFloat(e.target.value) || 0)
                         }
                         required
-                        placeholder="Item description"
+                      />
+
+                      <Input
+                        label="Amount"
+                        type="number"
+                        step="0.01"
+                        value={line.amount}
+                        onChange={(e) =>
+                          updateOrderLine(index, 'amount', parseFloat(e.target.value) || 1)
+                        }
+                        required
+                      />
+
+                      <Input
+                        label="Unit"
+                        value={line.unit}
+                        onChange={(e) => updateOrderLine(index, 'unit', e.target.value)}
+                        required
+                        placeholder="pcs, licenses, etc."
                       />
                     </div>
 
-                    <Input
-                      label="Unit Price ($)"
-                      type="number"
-                      step="0.01"
-                      value={line.unitPrice}
-                      onChange={(e) =>
-                        updateOrderLine(index, 'unitPrice', parseFloat(e.target.value) || 0)
-                      }
-                      required
-                    />
+                    <div className="text-right">
+                      <span className="text-sm text-gray-600">Total: </span>
+                      <span className="text-lg font-semibold tracking-tight text-ink">
+                        ${line.totalPrice.toFixed(2)}
+                      </span>
+                    </div>
 
-                    <Input
-                      label="Amount"
-                      type="number"
-                      step="0.01"
-                      value={line.amount}
-                      onChange={(e) =>
-                        updateOrderLine(index, 'amount', parseFloat(e.target.value) || 1)
-                      }
-                      required
-                    />
+                    {/* Catalog Suggestions Banner */}
+                    {availableSuggestions.length > 0 && (
+                      <div className="rounded-lg border border-amber-200 bg-amber-50/70 p-3.5">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-xs font-semibold uppercase tracking-wider text-amber-900">
+                            Negotiated Catalog Matches ({availableSuggestions.length})
+                          </span>
+                          <span className="text-xs text-amber-800">
+                            Click to apply your organization&apos;s pre-negotiated supplier price
+                          </span>
+                        </div>
+                        <div className="space-y-2">
+                          {availableSuggestions.map((s) => {
+                            const artPrice = Number(s.article.unit_price);
+                            const estTotal =
+                              s.estimatedTotalPrice ??
+                              s.estimated_total_price ??
+                              Math.round(artPrice * (line.amount || 1) * 100) / 100;
+                            const savings =
+                              line.totalPrice > 0
+                                ? Math.round((line.totalPrice - estTotal) * 100) / 100
+                                : s.savings;
 
-                    <Input
-                      label="Unit"
-                      value={line.unit}
-                      onChange={(e) => updateOrderLine(index, 'unit', e.target.value)}
-                      required
-                      placeholder="pcs, licenses, etc."
-                    />
+                            return (
+                              <div
+                                key={s.article.id}
+                                className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white rounded-md border border-amber-200/80 px-3 py-2"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-mono text-xs font-semibold px-1.5 py-0.5 rounded bg-ink-800/[0.06] text-ink">
+                                      {s.article.article_number}
+                                    </span>
+                                    <span className="text-sm font-medium text-ink truncate">
+                                      {s.article.description}
+                                    </span>
+                                    {s.article.supplier_name && (
+                                      <span className="inline-flex px-2 py-0.5 text-xs font-medium rounded-full bg-accent-soft/30 text-accent-deep">
+                                        {s.article.supplier_name}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-xs text-ink/65 mt-1 flex flex-wrap items-center gap-3">
+                                    <span>
+                                      Negotiated:{' '}
+                                      <strong className="text-ink">
+                                        ${artPrice.toFixed(2)} / {s.article.unit}
+                                      </strong>
+                                    </span>
+                                    <span>
+                                      Est. line total:{' '}
+                                      <strong className="text-ink">${estTotal.toFixed(2)}</strong>
+                                    </span>
+                                    {savings !== null && savings !== undefined && savings > 0 && (
+                                      <span className="inline-flex px-2 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+                                        Save ${savings.toFixed(2)}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => applyCatalogSuggestion(index, s)}
+                                  className="shrink-0"
+                                >
+                                  Use Catalog Price
+                                </Button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
-
-                  <div className="mt-2 text-right">
-                    <span className="text-sm text-gray-600">Total: </span>
-                    <span className="text-lg font-semibold tracking-tight text-ink">
-                      ${line.totalPrice.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
 
         {/* Total Cost */}
         <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6">
-          <div className="flex items-center justify-between">
-            <span className="text-lg font-medium text-gray-900">Total Cost</span>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <span className="text-lg font-medium text-gray-900">Total Cost</span>
+              <div className="mt-1">
+                {totalCost < approvalThreshold ? (
+                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+                    ✓ Auto-approved (below ${approvalThreshold.toLocaleString('en-US', { minimumFractionDigits: 2 })} — no buyer sign-off needed)
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">
+                    Requires buyer approval (${approvalThreshold.toLocaleString('en-US', { minimumFractionDigits: 2 })}+)
+                  </span>
+                )}
+              </div>
+            </div>
             <span className="text-3xl font-bold text-accent-deep">
               ${totalCost.toFixed(2)}
             </span>
@@ -463,4 +720,3 @@ export default function NewRequestPage() {
     </div>
   );
 }
-

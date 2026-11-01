@@ -16,7 +16,7 @@ requests across your organization.
 
 ```bash
 cp .env.example .env      # optional: add your OpenAI API key for PDF extraction
-docker compose up --build
+docker compose up --build # add --watch for live reload of frontend & backend
 ```
 
 | | URL |

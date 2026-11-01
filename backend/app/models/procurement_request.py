@@ -49,7 +49,8 @@ class ProcurementRequest(Base, TimestampMixin):
     # Status tracking
     status: Mapped[str] = mapped_column(String, nullable=False, default="open", index=True)
 
-    # Approval: every request needs sign-off by a buyer or admin.
+    # Approval: requests below the org's threshold ($2,000 by default) are
+    # auto-approved; requests at or above the threshold need buyer/admin sign-off.
     approval_status: Mapped[str] = mapped_column(
         String, nullable=False, default="pending", index=True
     )
@@ -88,6 +89,11 @@ class OrderLine(Base, CreatedAtMixin):
         nullable=False,
         index=True,
     )
+    article_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("articles.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     position_description: Mapped[str] = mapped_column(Text, nullable=False)
     unit_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
@@ -98,6 +104,7 @@ class OrderLine(Base, CreatedAtMixin):
     line_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     request: Mapped["ProcurementRequest"] = relationship(back_populates="order_lines")
+    article: Mapped["Article | None"] = relationship()
 
 
 class RequestActivity(Base, CreatedAtMixin):
@@ -141,4 +148,5 @@ class RequestDocument(Base, CreatedAtMixin):
 
 
 # Imported for the type-only forward reference in relationships above.
+from app.models.article import Article  # noqa: E402,F401
 from app.models.commodity_group import CommodityGroup  # noqa: E402,F401

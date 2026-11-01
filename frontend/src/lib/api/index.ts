@@ -2,6 +2,7 @@
 
 import { apiFetch, apiFetchObjectUrl, clearToken, setToken } from './client';
 import type {
+  ArticleSuggestion,
   CommodityGroup,
   OrganizationInvite,
   OrganizationMemberWithProfile,
@@ -10,6 +11,7 @@ import type {
 } from '@/types/database';
 
 export { ApiError, getToken, clearToken } from './client';
+export type { ArticleSuggestion } from '@/types/database';
 
 // ============================================================================
 // Types
@@ -45,8 +47,19 @@ export interface MyOrganization {
 // Request fields an org may optionally mark as required (see backend settings).
 export type ConfigurableRequiredField = 'vat_id' | 'department';
 
+export const DEFAULT_APPROVAL_THRESHOLD = 2000;
+
+export interface CommodityClassificationRule {
+  pattern: string;
+  commodity_group_id: number;
+  commodity_group_name?: string | null;
+}
+
 export interface OrganizationSettings {
   required_fields: ConfigurableRequiredField[];
+  approval_threshold?: number;
+  commodity_rules?: CommodityClassificationRule[];
+  accounting_guidelines?: string;
 }
 
 export interface MembersResponse {
@@ -60,6 +73,8 @@ export interface OrderLineInput {
   amount: number;
   unit: string;
   totalPrice: number;
+  articleId?: string | null;
+  suggestedArticles?: ArticleSuggestion[];
 }
 
 export interface CreateRequestInput {
@@ -119,6 +134,7 @@ export interface Article {
   article_number: string;
   supplier_id: string;
   supplier_name: string | null;
+  supplier_vat_id?: string | null;
   description: string;
   unit_price: string;
   currency: string;
@@ -132,6 +148,18 @@ export interface ArticlePage {
   total: number;
   limit: number;
   offset: number;
+}
+
+export interface CatalogMatchLineOut {
+  lineIndex?: number;
+  line_index?: number;
+  positionDescription?: string;
+  position_description?: string;
+  suggestions: ArticleSuggestion[];
+}
+
+export interface CatalogMatchResponse {
+  lines: CatalogMatchLineOut[];
 }
 
 // ============================================================================
@@ -170,7 +198,15 @@ export interface RequestActivity {
   id: string;
   request_id: string;
   actor_id: string | null;
-  action: 'created' | 'updated' | 'status_changed' | 'approved' | 'rejected' | 'document_attached';
+  action:
+    | 'created'
+    | 'updated'
+    | 'status_changed'
+    | 'approved'
+    | 'rejected'
+    | 'approval_reset'
+    | 'document_attached'
+    | 'catalog_article_applied';
   summary: string;
   detail: Record<string, unknown> | null;
   created_at: string;
@@ -206,6 +242,16 @@ export const requests = {
 
   update(requestId: string, input: UpdateRequestInput): Promise<ProcurementRequestWithDetails> {
     return apiFetch(`/requests/${requestId}`, { method: 'PUT', body: input });
+  },
+
+  applyCatalogArticle(
+    requestId: string,
+    lineId: string,
+    params: { articleId: string; updateVendor?: boolean }
+  ): Promise<ProcurementRequestWithDetails> {
+    return apiFetch(`/requests/${requestId}/order-lines/${lineId}/apply-article`, {
+      body: { articleId: params.articleId, updateVendor: params.updateVendor ?? true },
+    });
   },
 
   updateStatus(
@@ -260,7 +306,7 @@ export const organizations = {
     return apiFetch('/organizations/me/settings');
   },
 
-  updateSettings(settings: OrganizationSettings): Promise<OrganizationSettings> {
+  updateSettings(settings: Partial<OrganizationSettings>): Promise<OrganizationSettings> {
     return apiFetch('/organizations/me/settings', { method: 'PATCH', body: settings });
   },
 };
@@ -314,6 +360,38 @@ export const articles = {
 
   count(): Promise<{ count: number }> {
     return apiFetch('/articles/count');
+  },
+
+  suggest(params: {
+    q: string;
+    unit?: string;
+    amount?: number;
+    unitPrice?: number;
+    totalPrice?: number;
+    title?: string;
+    vendorName?: string;
+    limit?: number;
+  }): Promise<ArticleSuggestion[]> {
+    const qs = new URLSearchParams();
+    qs.set('q', params.q);
+    if (params.unit) qs.set('unit', params.unit);
+    if (params.amount !== undefined && params.amount > 0) qs.set('amount', String(params.amount));
+    if (params.unitPrice !== undefined) qs.set('unit_price', String(params.unitPrice));
+    if (params.totalPrice !== undefined) qs.set('total_price', String(params.totalPrice));
+    if (params.title) qs.set('title', params.title);
+    if (params.vendorName) qs.set('vendor_name', params.vendorName);
+    qs.set('limit', String(params.limit ?? 3));
+    return apiFetch(`/articles/suggest?${qs.toString()}`);
+  },
+
+  match(payload: {
+    title?: string;
+    vendorName?: string;
+    commodityGroupId?: number | null;
+    orderLines: OrderLineInput[];
+    limitPerLine?: number;
+  }): Promise<CatalogMatchResponse> {
+    return apiFetch('/articles/match', { body: payload });
   },
 };
 

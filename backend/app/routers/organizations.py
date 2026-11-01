@@ -9,13 +9,17 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_membership, get_current_user, require_org_admin
 from app.db.session import get_db
 from app.models import (
+    CommodityGroup,
     Organization,
     OrganizationInvite,
     OrganizationMember,
+    ProcurementRequest,
     Profile,
+    RequestActivity,
     User,
 )
 from app.schemas.organizations import (
+    DEFAULT_APPROVAL_THRESHOLD,
     InviteAccept,
     InviteCreate,
     InviteOut,
@@ -79,7 +83,11 @@ def get_my_organization(
     )
 
 
-@router.get("/me/settings", response_model=OrganizationSettings)
+@router.get(
+    "/me/settings",
+    response_model=OrganizationSettings,
+    response_model_exclude_none=True,
+)
 def get_settings(
     membership: OrganizationMember = Depends(get_current_membership),
     db: Session = Depends(get_db),
@@ -88,16 +96,85 @@ def get_settings(
     return OrganizationSettings(**(org.settings or {}))
 
 
-@router.patch("/me/settings", response_model=OrganizationSettings)
+@router.patch(
+    "/me/settings",
+    response_model=OrganizationSettings,
+    response_model_exclude_none=True,
+)
 def update_settings(
     payload: OrganizationSettings,
     membership: OrganizationMember = Depends(require_org_admin),
     db: Session = Depends(get_db),
 ) -> OrganizationSettings:
     org = db.get(Organization, membership.organization_id)
-    org.settings = payload.model_dump()
+    merged = dict(org.settings or {})
+    updates = payload.model_dump(exclude_unset=True)
+
+    if "commodity_rules" in updates and updates["commodity_rules"] is not None:
+        normalized_rules: list[dict] = []
+        for rule in updates["commodity_rules"]:
+            pattern = (rule.get("pattern") or "").strip()
+            if not pattern:
+                continue
+            cg = db.get(CommodityGroup, rule["commodity_group_id"])
+            if cg is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Unknown commodity_group_id: {rule['commodity_group_id']}",
+                )
+            normalized_rules.append(
+                {
+                    "pattern": pattern,
+                    "commodity_group_id": cg.id,
+                    "commodity_group_name": cg.name,
+                }
+            )
+        updates["commodity_rules"] = normalized_rules
+
+    if "accounting_guidelines" in updates and updates["accounting_guidelines"] is not None:
+        updates["accounting_guidelines"] = updates["accounting_guidelines"].strip()
+
+    for key, value in updates.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+
+    org.settings = merged
+
+    if "approval_threshold" in updates:
+        raw_threshold = merged.get("approval_threshold")
+        effective_threshold = (
+            DEFAULT_APPROVAL_THRESHOLD if raw_threshold is None else float(raw_threshold)
+        )
+        if effective_threshold > 0:
+            pending_below = db.scalars(
+                select(ProcurementRequest).where(
+                    ProcurementRequest.organization_id == membership.organization_id,
+                    ProcurementRequest.approval_status == "pending",
+                    ProcurementRequest.total_cost < effective_threshold,
+                )
+            ).all()
+            now = datetime.now(timezone.utc)
+            for req in pending_below:
+                req.approval_status = "approved"
+                req.approved_by = None
+                req.approved_at = now
+                db.add(
+                    RequestActivity(
+                        request_id=req.id,
+                        actor_id=membership.user_id,
+                        action="approved",
+                        summary=f"Request auto-approved (below ${effective_threshold:,.2f} threshold)",
+                        detail={
+                            "auto_approved": True,
+                            "approval_threshold": effective_threshold,
+                        },
+                    )
+                )
+
     db.commit()
-    return payload
+    return OrganizationSettings(**org.settings)
 
 
 @router.get("/me/members", response_model=MembersResponse)

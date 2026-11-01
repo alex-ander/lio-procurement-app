@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.articles import ArticleOut, ArticleSuggestionOut
+
 RequestStatus = Literal["open", "in_progress", "closed"]
 ApprovalStatus = Literal["pending", "approved", "rejected"]
 
@@ -13,11 +15,25 @@ ApprovalStatus = Literal["pending", "approved", "rejected"]
 # ---------------------------------------------------------------------------
 
 class OrderLineIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     position_description: str = Field(alias="positionDescription")
     unit_price: float = Field(alias="unitPrice")
     amount: float
     unit: str
     total_price: float = Field(alias="totalPrice")
+    article_id: uuid.UUID | None = Field(default=None, alias="articleId")
+
+
+class ApplyCatalogArticleIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    article_id: uuid.UUID = Field(alias="articleId")
+    update_vendor: bool = Field(
+        default=False,
+        alias="updateVendor",
+        description="Also update request vendor_name and vat_id to the catalog article's supplier",
+    )
 
 
 class RequestCreate(BaseModel):
@@ -67,6 +83,8 @@ class OrderLineOut(BaseModel):
 
     id: uuid.UUID
     request_id: uuid.UUID
+    article_id: uuid.UUID | None = None
+    article: ArticleOut | None = None
     position_description: str
     unit_price: float
     amount: float
@@ -74,6 +92,7 @@ class OrderLineOut(BaseModel):
     total_price: float
     line_order: int
     created_at: datetime
+    suggested_articles: list[ArticleSuggestionOut] = Field(default_factory=list)
 
 
 class RequestActivityOut(BaseModel):
