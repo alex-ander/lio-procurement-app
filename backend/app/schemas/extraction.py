@@ -1,5 +1,7 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.articles import ArticleSuggestionOut
+
 
 class PdfParseResponse(BaseModel):
     text: str
@@ -19,6 +21,9 @@ class OrderLineData(BaseModel):
     amount: float = 0
     unit: str = ""
     total_price: float = Field(default=0, alias="totalPrice")
+    suggested_articles: list[ArticleSuggestionOut] = Field(
+        default_factory=list, alias="suggestedArticles"
+    )
 
     @field_validator("position_description", "unit", mode="before")
     @classmethod

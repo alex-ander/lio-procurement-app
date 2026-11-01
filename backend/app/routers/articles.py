@@ -5,7 +5,18 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.deps import get_current_membership
 from app.db.session import get_db
 from app.models import Article, OrganizationMember
-from app.schemas.articles import ArticleOut, ArticlePage
+from app.schemas.articles import (
+    ArticleOut,
+    ArticlePage,
+    ArticleSuggestionOut,
+    CatalogMatchRequest,
+    CatalogMatchResponse,
+)
+from app.services.catalog_matching import (
+    load_org_catalog_index,
+    match_catalog_for_request,
+    match_order_line,
+)
 
 router = APIRouter(prefix="/articles", tags=["articles"])
 
@@ -23,10 +34,11 @@ def list_articles(
 ) -> ArticlePage:
     filters = [Article.organization_id == membership.organization_id]
     if search:
-        term = f"%{search}%"
-        filters.append(
-            or_(Article.description.ilike(term), Article.article_number.ilike(term))
-        )
+        for token in search.split():
+            term = f"%{token}%"
+            filters.append(
+                or_(Article.description.ilike(term), Article.article_number.ilike(term))
+            )
     if supplier_id:
         filters.append(Article.supplier_id == supplier_id)
 
@@ -48,6 +60,7 @@ def list_articles(
             article_number=a.article_number,
             supplier_id=a.supplier_id,
             supplier_name=a.supplier.name if a.supplier else None,
+            supplier_vat_id=a.supplier.vat_id if a.supplier else None,
             description=a.description,
             unit_price=a.unit_price,
             currency=a.currency,
@@ -74,3 +87,41 @@ def count_articles(
         or 0
     )
     return {"count": total}
+
+
+@router.get("/suggest", response_model=list[ArticleSuggestionOut])
+def suggest_articles(
+    q: str = Query(..., min_length=1, description="Order line description or search query"),
+    unit: str | None = Query(default=None),
+    amount: float = Query(default=1.0, gt=0),
+    unit_price: float | None = Query(default=None),
+    total_price: float | None = Query(default=None),
+    title: str | None = Query(default=None),
+    vendor_name: str | None = Query(default=None),
+    limit: int = Query(default=5, ge=1, le=20),
+    membership: OrganizationMember = Depends(get_current_membership),
+    db: Session = Depends(get_db),
+) -> list[ArticleSuggestionOut]:
+    """Suggest negotiated catalog articles matching a single order line description."""
+    catalog = load_org_catalog_index(db, membership.organization_id)
+    return match_order_line(
+        catalog=catalog,
+        position_description=q,
+        unit=unit,
+        amount=amount,
+        unit_price=unit_price,
+        total_price=total_price,
+        title=title,
+        vendor_name=vendor_name,
+        limit=limit,
+    )
+
+
+@router.post("/match", response_model=CatalogMatchResponse)
+def match_articles(
+    payload: CatalogMatchRequest,
+    membership: OrganizationMember = Depends(get_current_membership),
+    db: Session = Depends(get_db),
+) -> CatalogMatchResponse:
+    """Match a batch of request order lines against the organization's catalog."""
+    return match_catalog_for_request(db, membership.organization_id, payload)

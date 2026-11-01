@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 
 from openai import OpenAI
 from sqlalchemy import select
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import CommodityGroup
 from app.schemas.extraction import ExtractedVendorData, ExtractionResponse
+from app.services.catalog_matching import load_org_catalog_index, match_order_line
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +101,15 @@ def _strip_markdown_fences(content: str) -> str:
     return cleaned
 
 
-def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
+def extract_vendor_data(
+    pdf_text: str,
+    db: Session,
+    organization_id: uuid.UUID | None = None,
+) -> ExtractionResponse:
     """Extract vendor data and classify commodity group in one AI call.
 
-    Port of ``src/actions/extraction.ts`` — same prompt, model and validation.
+    Port of ``src/actions/extraction.ts`` — same prompt, model and validation,
+    plus automatic catalog article matching for each extracted order line.
     """
     if not pdf_text or not pdf_text.strip():
         return ExtractionResponse(success=False, error="No text provided for extraction")
@@ -173,6 +180,23 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
             extracted.commodity_group_name = None
             if "Commodity Group" not in missing_fields:
                 missing_fields.append("Commodity Group")
+
+    # Suggest matching negotiated catalog articles for each extracted order line.
+    if organization_id is not None and extracted.order_lines:
+        catalog = load_org_catalog_index(db, organization_id)
+        if catalog:
+            for line in extracted.order_lines:
+                line.suggested_articles = match_order_line(
+                    catalog=catalog,
+                    position_description=line.position_description,
+                    unit=line.unit,
+                    amount=line.amount,
+                    unit_price=line.unit_price,
+                    total_price=line.total_price,
+                    title=extracted.title,
+                    vendor_name=extracted.vendor_name,
+                    limit=3,
+                )
 
     return ExtractionResponse(
         success=True,

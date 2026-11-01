@@ -818,16 +818,256 @@ def test_org_settings_admin_only():
     assert r.status_code == 403
 
 
+def test_catalog_article_suggestions_and_negotiated_pricing():
+    requester = _signin("requester@acme.com")
+    admin = _signin("admin@acme.com")
+    walmart = _signin("admin@walmart.com")
+
+    # 1. Multi-token search on GET /articles works when words aren't contiguous
+    r = client.get("/articles?search=preserved+moss+wall", headers=_auth(requester))
+    assert r.status_code == 200
+    assert r.json()["total"] >= 1
+    assert any(a["article_number"] == "HAR-00172" for a in r.json()["items"])
+
+    # 2. GET /articles/suggest matches quote-style descriptions and calculates savings
+    r = client.get(
+        "/articles/suggest",
+        params={
+            "q": 'Module "Forest & Ball Moss"',
+            "unit": "square feet",
+            "amount": 13.78,
+            "total_price": 716.56,
+            "title": "Moss Wall Installation",
+        },
+        headers=_auth(requester),
+    )
+    assert r.status_code == 200, r.text
+    suggestions = r.json()
+    assert len(suggestions) >= 1
+    top = suggestions[0]
+    assert top["article"]["article_number"] == "HAR-00172"
+    assert float(top["article"]["unit_price"]) == 44.59
+    assert top["unitMatches"] is True
+    assert abs(top["estimatedTotalPrice"] - 614.45) <= 0.02
+    assert abs(top["savings"] - 102.11) <= 0.02
+
+    # 3. POST /articles/match batch-matches multiple order lines
+    match_payload = {
+        "title": "Moss Wall & Laptops",
+        "vendorName": "Greenmantle Moss Studio, LLC",
+        "orderLines": [
+            {
+                "positionDescription": 'Moss Art Panel "Mixed Moss" 63 x 24 in',
+                "unitPrice": 715.26,
+                "amount": 1.0,
+                "unit": "pieces",
+                "totalPrice": 715.26,
+            },
+            {
+                "positionDescription": "13-inch MacBook Air: Apple M2 chip, 16GB, 512GB SSD",
+                "unitPrice": 1409.06,
+                "amount": 1.0,
+                "unit": "pieces",
+                "totalPrice": 1409.06,
+            },
+        ],
+        "limitPerLine": 3,
+    }
+    r = client.post("/articles/match", json=match_payload, headers=_auth(requester))
+    assert r.status_code == 200, r.text
+    matched_lines = r.json()["lines"]
+    assert len(matched_lines) == 2
+    moss_nums = [s["article"]["article_number"] for s in matched_lines[0]["suggestions"]]
+    assert "RED-00196" in moss_nums or "HAR-00172" in moss_nums
+    laptop_descs = [s["article"]["description"] for s in matched_lines[1]["suggestions"]]
+    assert any("business laptop" in d.lower() for d in laptop_descs)
+
+    # Tenant isolation: Walmart has an empty catalog, so suggestions are empty
+    r_walmart = client.post("/articles/match", json=match_payload, headers=_auth(walmart))
+    assert r_walmart.status_code == 200
+    assert all(line["suggestions"] == [] for line in r_walmart.json()["lines"])
+
+    # 4. Creating an off-catalog request surfaces suggested_articles on order_lines
+    req_payload = {
+        "requestorName": "Rene Requester",
+        "titleShortDescription": "Moss Wall Decor",
+        "vendorName": "Greenmantle Moss Studio, LLC",
+        "vatId": "85-3252405",
+        "commodityGroupId": 15,
+        "totalCost": 715.26,
+        "department": "Facilities",
+        "orderLines": [
+            {
+                "positionDescription": 'Moss Art Panel "Mixed Moss" 63 x 24 in',
+                "unitPrice": 715.26,
+                "amount": 1.0,
+                "unit": "pieces",
+                "totalPrice": 715.26,
+            }
+        ],
+    }
+    r = client.post("/requests", json=req_payload, headers=_auth(requester))
+    assert r.status_code == 201, r.text
+    created = r.json()
+    req_id = created["id"]
+    line_id = created["order_lines"][0]["id"]
+    assert created["order_lines"][0]["article_id"] is None
+    line_suggestions = created["order_lines"][0]["suggested_articles"]
+    assert len(line_suggestions) >= 1
+    red_suggestion = next(
+        s for s in line_suggestions if s["article"]["article_number"] == "RED-00196"
+    )
+    red_article_id = red_suggestion["article"]["id"]
+
+    # 5. Apply the suggested catalog article to the existing order line
+    r = client.post(
+        f"/requests/{req_id}/order-lines/{line_id}/apply-article",
+        json={"articleId": red_article_id, "updateVendor": True},
+        headers=_auth(requester),
+    )
+    assert r.status_code == 200, r.text
+    applied = r.json()
+    assert applied["vendor_name"] == "Redwood Facility Group"
+    assert applied["vat_id"] == "10-0009732"
+    assert applied["total_cost"] == 320.0
+    updated_line = applied["order_lines"][0]
+    assert updated_line["article_id"] == red_article_id
+    assert updated_line["article"]["article_number"] == "RED-00196"
+    assert updated_line["unit_price"] == 320.0
+    assert updated_line["total_price"] == 320.0
+
+    # Activity log recorded catalog_article_applied with savings
+    r_act = client.get(f"/requests/{req_id}/activity", headers=_auth(requester))
+    assert r_act.status_code == 200
+    act_entry = next(
+        a for a in r_act.json() if a["action"] == "catalog_article_applied"
+    )
+    assert act_entry["detail"]["article_number"] == "RED-00196"
+    assert abs(act_entry["detail"]["savings"] - 395.26) <= 0.02
+
+    # 6. Creating a request with articleId directly enforces the negotiated catalog price
+    direct_payload = {
+        "requestorName": "Rene Requester",
+        "titleShortDescription": "Framed Moss Panel",
+        "vendorName": "Redwood Facility Group",
+        "vatId": "10-0009732",
+        "commodityGroupId": 15,
+        "totalCost": 999.0,  # inflated quote total; should be adjusted down to negotiated price
+        "department": "Facilities",
+        "orderLines": [
+            {
+                "positionDescription": "Custom Moss Panel",
+                "unitPrice": 499.50,  # inflated unit price; should snap to $320.00
+                "amount": 2.0,
+                "unit": "piece",
+                "totalPrice": 999.0,
+                "articleId": red_article_id,
+            }
+        ],
+    }
+    r = client.post("/requests", json=direct_payload, headers=_auth(requester))
+    assert r.status_code == 201, r.text
+    direct_req = r.json()
+    direct_id = direct_req["id"]
+    assert direct_req["order_lines"][0]["article_id"] == red_article_id
+    assert direct_req["order_lines"][0]["unit_price"] == 320.0
+    assert direct_req["order_lines"][0]["total_price"] == 640.0
+    assert direct_req["total_cost"] == 640.0
+
+    # Unknown or cross-tenant articleId is rejected with 422
+    bad_payload = dict(direct_payload)
+    bad_payload["orderLines"] = [
+        dict(direct_payload["orderLines"][0], articleId=str(uuid.uuid4()))
+    ]
+    assert (
+        client.post("/requests", json=bad_payload, headers=_auth(requester)).status_code
+        == 422
+    )
+    assert (
+        client.post("/requests", json=direct_payload, headers=_auth(walmart)).status_code
+        == 422
+    )
+
+    # Cleanup
+    for rid in (req_id, direct_id):
+        client.delete(f"/requests/{rid}", headers=_auth(admin))
+
+
+def test_extraction_attaches_catalog_suggestions(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from app.core.config import settings
+    import app.services.extraction as extraction_mod
+
+    token = _signin("requester@acme.com")
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+
+    fake_llm_json = json.dumps(
+        {
+            "title": "Moss Wall Decor",
+            "vendorName": "Greenmantle Moss Studio, LLC",
+            "vatId": "85-3252405",
+            "department": "Lio Technologies",
+            "orderLines": [
+                {
+                    "positionDescription": 'Module "Forest & Ball Moss"',
+                    "unitPrice": 52.0,
+                    "amount": 13.78,
+                    "unit": "square feet",
+                    "totalPrice": 716.56,
+                }
+            ],
+            "totalCost": 716.56,
+            "commodityGroupId": 15,
+            "commodityGroupName": "Office Equipment",
+        }
+    )
+
+    class _FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **_kw: SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(content=fake_llm_json)
+                            )
+                        ]
+                    )
+                )
+            )
+
+    monkeypatch.setattr(extraction_mod, "OpenAI", _FakeOpenAI)
+
+    r = client.post(
+        "/extraction",
+        json={"text": "Sample quote text for Forest & Ball Moss wall"},
+        headers=_auth(token),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    lines = body["data"]["orderLines"]
+    assert len(lines) == 1
+    assert len(lines[0]["suggestedArticles"]) >= 1
+    top_suggestion = lines[0]["suggestedArticles"][0]
+    assert top_suggestion["article"]["article_number"] == "HAR-00172"
+    assert float(top_suggestion["article"]["unit_price"]) == 44.59
+    assert abs(top_suggestion["savings"] - 102.11) <= 0.02
+
+
 if __name__ == "__main__":
     test_full_user_journey()
     test_pdf_parse()
     test_extraction_without_api_key()
     test_activity_log_and_document()
     test_commodity_groups_expanded()
-    test_suppliers_seeded_with_empty_descriptions()
+    test_suppliers_are_org_scoped_master_data()
+    test_articles_catalog_paginated_and_searchable()
     test_seed_is_idempotent()
     test_demo_user_can_sign_in()
     test_approval_flow_with_roles()
     test_org_settings_required_fields()
     test_org_settings_admin_only()
+    test_catalog_article_suggestions_and_negotiated_pricing()
     print("ALL SMOKE TESTS PASSED")

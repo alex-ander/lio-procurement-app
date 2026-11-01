@@ -106,6 +106,21 @@ export default function RequestDetailPage() {
     setBusy(false);
   };
 
+  const applyCatalogArticle = async (lineId: string, articleId: string) => {
+    setBusy(true); setError(''); setSuccess('');
+    try {
+      await api.requests.applyCatalogArticle(id, lineId, {
+        articleId,
+        updateVendor: true,
+      });
+      setSuccess('Applied negotiated catalog article and updated pricing.');
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to apply catalog article');
+    }
+    setBusy(false);
+  };
+
   const remove = async () => {
     if (!confirm('Delete this request? This cannot be undone.')) return;
     setBusy(true);
@@ -150,6 +165,7 @@ export default function RequestDetailPage() {
           amount: l.amount,
           unit: l.unit,
           totalPrice: l.total_price,
+          articleId: l.article_id ?? null,
         })),
       });
       setEditing(false);
@@ -261,18 +277,101 @@ export default function RequestDetailPage() {
 
           <div className="lio-card p-6">
             <h2 className="text-lg font-semibold tracking-tight text-ink mb-4">Order Lines</h2>
-            <div className="space-y-2">
-              {request.order_lines?.map((line, i) => (
-                <div key={line.id} className="flex justify-between items-start bg-ink-800/[0.02] rounded-lg p-3">
-                  <div>
-                    <p className="text-sm font-medium text-ink">{i + 1}. {line.position_description}</p>
-                    <p className="text-sm text-ink/55 mt-0.5">
-                      {line.amount} {line.unit} × {usd(line.unit_price)}
-                    </p>
+            <div className="space-y-3">
+              {request.order_lines?.map((line, i) => {
+                const suggestions = (line.suggested_articles || []).filter(
+                  (s) => s.article.id !== line.article_id
+                );
+
+                return (
+                  <div key={line.id} className="bg-ink-800/[0.02] rounded-lg p-3 space-y-2.5">
+                    <div className="flex justify-between items-start gap-2">
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-sm font-medium text-ink">
+                            {i + 1}. {line.position_description}
+                          </p>
+                          {line.article ? (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                              ✓ Catalog Agreement · {line.article.article_number}
+                              {line.article.supplier_name ? ` (${line.article.supplier_name})` : ''}
+                            </span>
+                          ) : suggestions.length > 0 ? (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
+                              Off-catalog · {suggestions.length} catalog match
+                              {suggestions.length === 1 ? '' : 'es'}
+                            </span>
+                          ) : null}
+                        </div>
+                        <p className="text-sm text-ink/55 mt-0.5">
+                          {line.amount} {line.unit} × {usd(line.unit_price)}
+                        </p>
+                      </div>
+                      <p className="text-sm font-semibold text-ink">{usd(line.total_price)}</p>
+                    </div>
+
+                    {/* Suggestions for unlinked order lines */}
+                    {!line.article && suggestions.length > 0 && (
+                      <div className="rounded-md border border-amber-200 bg-amber-50/70 p-2.5 space-y-2">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-amber-900">
+                          Negotiated Catalog Alternatives
+                        </p>
+                        {suggestions.map((s) => {
+                          const artPrice = Number(s.article.unit_price);
+                          const estTotal =
+                            s.estimatedTotalPrice ??
+                            s.estimated_total_price ??
+                            Math.round(artPrice * line.amount * 100) / 100;
+                          const savings = s.savings;
+
+                          return (
+                            <div
+                              key={s.article.id}
+                              className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white rounded border border-amber-200/80 px-2.5 py-2"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="font-mono text-xs font-semibold px-1.5 py-0.5 rounded bg-ink-800/[0.06] text-ink">
+                                    {s.article.article_number}
+                                  </span>
+                                  <span className="text-xs font-medium text-ink truncate">
+                                    {s.article.description}
+                                  </span>
+                                  {s.article.supplier_name && (
+                                    <span className="inline-flex px-2 py-0.5 text-[11px] font-medium rounded-full bg-accent-soft/30 text-accent-deep">
+                                      {s.article.supplier_name}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-xs text-ink/65 mt-0.5 flex flex-wrap items-center gap-2.5">
+                                  <span>
+                                    Negotiated: <strong>${artPrice.toFixed(2)}/{s.article.unit}</strong> (Est.{' '}
+                                    <strong>${estTotal.toFixed(2)}</strong>)
+                                  </span>
+                                  {savings !== null && savings !== undefined && savings > 0 && (
+                                    <span className="inline-flex px-1.5 py-0.5 rounded-full text-[11px] font-semibold bg-green-100 text-green-800">
+                                      Save ${savings.toFixed(2)}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={busy}
+                                onClick={() => applyCatalogArticle(line.id, s.article.id)}
+                                className="shrink-0"
+                              >
+                                Apply Catalog Price
+                              </Button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
-                  <p className="text-sm font-semibold text-ink">{usd(line.total_price)}</p>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 

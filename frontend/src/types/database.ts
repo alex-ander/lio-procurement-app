@@ -45,6 +45,32 @@ export type CommodityGroup = {
   created_at: string;
 };
 
+export type CatalogArticle = {
+  id: string;
+  article_number: string;
+  supplier_id: string;
+  supplier_name: string | null;
+  supplier_vat_id?: string | null;
+  description: string;
+  unit_price: string | number;
+  currency: string;
+  unit: string;
+  quantity: string | number;
+  created_at: string;
+};
+
+export type ArticleSuggestion = {
+  article: CatalogArticle;
+  score: number;
+  matchReason?: string;
+  match_reason?: string;
+  estimatedTotalPrice?: number;
+  estimated_total_price?: number;
+  savings: number | null;
+  unitMatches?: boolean;
+  unit_matches?: boolean;
+};
+
 export type ProcurementRequest = {
   id: string;
   user_id: string;
@@ -68,6 +94,8 @@ export type ProcurementRequest = {
 export type OrderLine = {
   id: string;
   request_id: string;
+  article_id?: string | null;
+  article?: CatalogArticle | null;
   position_description: string;
   unit_price: number;
   amount: number;
@@ -75,6 +103,7 @@ export type OrderLine = {
   total_price: number;
   line_order: number;
   created_at: string;
+  suggested_articles?: ArticleSuggestion[];
 };
 
 // ============================================================================
@@ -93,4 +122,3 @@ export type OrganizationWithRole = Organization & {
 export type OrganizationMemberWithProfile = OrganizationMember & {
   profiles: Profile | null;
 };
-
