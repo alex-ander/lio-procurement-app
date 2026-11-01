@@ -47,8 +47,16 @@ export interface MyOrganization {
 // Request fields an org may optionally mark as required (see backend settings).
 export type ConfigurableRequiredField = 'vat_id' | 'department';
 
+export interface CommodityClassificationRule {
+  pattern: string;
+  commodity_group_id: number;
+  commodity_group_name?: string | null;
+}
+
 export interface OrganizationSettings {
   required_fields: ConfigurableRequiredField[];
+  commodity_rules?: CommodityClassificationRule[];
+  accounting_guidelines?: string;
 }
 
 export interface MembersResponse {

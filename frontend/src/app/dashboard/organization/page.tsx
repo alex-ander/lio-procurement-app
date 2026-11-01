@@ -2,7 +2,8 @@
 
 import { useState, useEffect } from 'react';
 import * as api from '@/lib/api';
-import { Button, Input, Alert } from '@/components/base';
+import { useCommodityGroups } from '@/lib/hooks/useCommodityGroups';
+import { Button, Input, Alert, TextArea } from '@/components/base';
 import type { OrganizationMemberWithProfile, OrganizationInvite } from '@/types/database';
 
 type Tab = 'members' | 'settings';
@@ -14,6 +15,7 @@ const ROLE_BADGES: Record<string, string> = {
 };
 
 export default function OrganizationPage() {
+  const { data: commodityGroups } = useCommodityGroups();
   const [tab, setTab] = useState<Tab>('members');
   const [members, setMembers] = useState<OrganizationMemberWithProfile[]>([]);
   const [invites, setInvites] = useState<OrganizationInvite[]>([]);
@@ -26,6 +28,10 @@ export default function OrganizationPage() {
   const [organizationName, setOrganizationName] = useState<string>('');
   const [role, setRole] = useState<api.MemberRole | null>(null);
   const [requiredFields, setRequiredFields] = useState<api.ConfigurableRequiredField[]>([]);
+  const [accountingGuidelines, setAccountingGuidelines] = useState('');
+  const [commodityRules, setCommodityRules] = useState<api.CommodityClassificationRule[]>([]);
+  const [newRulePattern, setNewRulePattern] = useState('');
+  const [newRuleGroupId, setNewRuleGroupId] = useState<number | ''>('');
   const [savingSettings, setSavingSettings] = useState(false);
 
   useEffect(() => {
@@ -48,6 +54,8 @@ export default function OrganizationPage() {
       setMembers(result.members);
       setInvites(result.invites);
       setRequiredFields(settings.required_fields);
+      setAccountingGuidelines(settings.accounting_guidelines || '');
+      setCommodityRules(settings.commodity_rules || []);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load organization');
     }
@@ -111,6 +119,55 @@ export default function OrganizationPage() {
       await loadOrganization(); // revert to server state
     }
     setSavingSettings(false);
+  };
+
+  const saveAccountingSettings = async (
+    nextGuidelines: string,
+    nextRules: api.CommodityClassificationRule[]
+  ) => {
+    setSavingSettings(true);
+    setError('');
+    setSuccess('');
+    try {
+      const saved = await api.organizations.updateSettings({
+        required_fields: requiredFields,
+        accounting_guidelines: nextGuidelines,
+        commodity_rules: nextRules,
+      });
+      setRequiredFields(saved.required_fields);
+      setAccountingGuidelines(saved.accounting_guidelines || '');
+      setCommodityRules(saved.commodity_rules || []);
+      setSuccess('Accounting classification rules updated');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update settings');
+      await loadOrganization();
+    }
+    setSavingSettings(false);
+  };
+
+  const handleAddCommodityRule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newRulePattern.trim() || !newRuleGroupId) {
+      setError('Please enter an item/condition description and select a target commodity group');
+      return;
+    }
+    const nextRules = [
+      ...commodityRules,
+      {
+        pattern: newRulePattern.trim(),
+        commodity_group_id: Number(newRuleGroupId),
+      },
+    ];
+    setCommodityRules(nextRules);
+    setNewRulePattern('');
+    setNewRuleGroupId('');
+    await saveAccountingSettings(accountingGuidelines, nextRules);
+  };
+
+  const handleRemoveCommodityRule = async (index: number) => {
+    const nextRules = commodityRules.filter((_, idx) => idx !== index);
+    setCommodityRules(nextRules);
+    await saveAccountingSettings(accountingGuidelines, nextRules);
   };
 
   if (loading) {
@@ -267,30 +324,130 @@ export default function OrganizationPage() {
       )}
 
       {tab === 'settings' && (
-        <div className="lio-card p-6">
-          <h2 className="text-xl font-semibold tracking-tight text-ink">Request Settings</h2>
-          <p className="text-sm text-ink/55 mt-1 mb-4">
-            Choose which optional fields are required when creating a request.
-          </p>
-          <div className="space-y-2">
-            {REQUIRABLE_FIELDS.map((field) => {
-              const checked = requiredFields.includes(field.key);
-              return (
-                <label
-                  key={field.key}
-                  className="flex items-center gap-3 rounded-xl border border-line px-4 py-3 cursor-pointer hover:bg-ink-800/[0.02]"
+        <div className="space-y-6">
+          <div className="lio-card p-6">
+            <h2 className="text-xl font-semibold tracking-tight text-ink">Request Settings</h2>
+            <p className="text-sm text-ink/55 mt-1 mb-4">
+              Choose which optional fields are required when creating a request.
+            </p>
+            <div className="space-y-2">
+              {REQUIRABLE_FIELDS.map((field) => {
+                const checked = requiredFields.includes(field.key);
+                return (
+                  <label
+                    key={field.key}
+                    className="flex items-center gap-3 rounded-xl border border-line px-4 py-3 cursor-pointer hover:bg-ink-800/[0.02]"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={savingSettings}
+                      onChange={() => toggleRequiredField(field.key)}
+                      className="h-4 w-4 accent-accent-deep"
+                    />
+                    <span className="text-sm text-ink">Require {field.label}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="lio-card p-6 space-y-6">
+            <div>
+              <h2 className="text-xl font-semibold tracking-tight text-ink">
+                Commodity Group Accounting Rules
+              </h2>
+              <p className="text-sm text-ink/55 mt-1">
+                Configure organization-specific accounting rules for AI commodity group classification.
+                The system also automatically learns from your organization&apos;s past bookings and manual commodity group corrections.
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <TextArea
+                label="Accounting Policy / Guidelines"
+                value={accountingGuidelines}
+                onChange={(e) => setAccountingGuidelines(e.target.value)}
+                rows={3}
+                placeholder="e.g., Cable ties always have to be booked under Electrical Engineering, printer toner under IT Hardware, and small software subscriptions under Office Supplies."
+              />
+              <div className="flex justify-end">
+                <Button
+                  type="button"
+                  size="sm"
+                  loading={savingSettings}
+                  disabled={savingSettings}
+                  onClick={() => saveAccountingSettings(accountingGuidelines, commodityRules)}
                 >
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    disabled={savingSettings}
-                    onChange={() => toggleRequiredField(field.key)}
-                    className="h-4 w-4 accent-accent-deep"
-                  />
-                  <span className="text-sm text-ink">Require {field.label}</span>
-                </label>
-              );
-            })}
+                  Save Guidelines
+                </Button>
+              </div>
+            </div>
+
+            <div className="border-t border-line pt-5 space-y-4">
+              <div>
+                <h3 className="text-sm font-semibold text-ink">Custom Item-to-Commodity Group Mappings</h3>
+                <p className="text-xs text-ink/55 mt-0.5">
+                  Map specific items or conditions directly to a target commodity group.
+                </p>
+              </div>
+
+              {commodityRules.length > 0 && (
+                <div className="divide-y divide-line rounded-xl border border-line overflow-hidden">
+                  {commodityRules.map((rule, idx) => {
+                    const matchedGroup = commodityGroups?.find((g) => g.id === rule.commodity_group_id);
+                    return (
+                      <div key={idx} className="px-4 py-3 flex items-center justify-between gap-4 bg-white">
+                        <div className="min-w-0 text-sm">
+                          <span className="font-medium text-ink">&ldquo;{rule.pattern}&rdquo;</span>
+                          <span className="mx-2 text-ink/40">&rarr;</span>
+                          <span className="text-ink/80">
+                            {matchedGroup
+                              ? `${matchedGroup.id} · ${matchedGroup.category} · ${matchedGroup.name}`
+                              : `${rule.commodity_group_id} · ${rule.commodity_group_name || ''}`}
+                          </span>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={savingSettings}
+                          onClick={() => handleRemoveCommodityRule(idx)}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <form onSubmit={handleAddCommodityRule} className="flex flex-col sm:flex-row gap-3">
+                <Input
+                  value={newRulePattern}
+                  onChange={(e) => setNewRulePattern(e.target.value)}
+                  placeholder="Item or condition (e.g., Cable ties, Printer toner, Small software subscriptions)"
+                  className="flex-1"
+                  disabled={savingSettings}
+                />
+                <select
+                  value={newRuleGroupId}
+                  onChange={(e) => setNewRuleGroupId(e.target.value ? Number(e.target.value) : '')}
+                  disabled={savingSettings}
+                  className="h-11 px-3.5 border border-line rounded-xl text-sm text-ink bg-white focus:outline-none focus:ring-2 focus:ring-accent-deep/60 sm:max-w-xs"
+                >
+                  <option value="">Select commodity group...</option>
+                  {commodityGroups?.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.id} - {g.category} - {g.name}
+                    </option>
+                  ))}
+                </select>
+                <Button type="submit" variant="outline" disabled={savingSettings} className="shrink-0">
+                  + Add Rule
+                </Button>
+              </form>
+            </div>
           </div>
         </div>
       )}
