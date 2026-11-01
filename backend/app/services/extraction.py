@@ -7,7 +7,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import CommodityGroup
+from app.models import (
+    CommodityGroup,
+    Organization,
+    ProcurementRequest,
+    RequestActivity,
+)
 from app.schemas.extraction import ExtractedVendorData, ExtractionResponse
 from app.services.catalog_matching import load_org_catalog_index, match_order_line
 
@@ -21,12 +26,177 @@ SYSTEM_PROMPT = (
 )
 
 
-def _build_prompt(pdf_text: str, commodity_groups_list: str) -> str:
-    return f"""You are a data extraction and classification specialist. Extract procurement/vendor offer information from the following US business quote text AND classify it into the appropriate commodity group.
+def _build_category_overview(commodity_groups: list[CommodityGroup]) -> str:
+    """Build a compact overview of all main categories and their base item families.
 
-Available Commodity Groups (ID | Category | Name):
-{commodity_groups_list}
+    Collapses ``<Base Item> — <Variant>`` leaves into ``<Base Item>`` so Step 1
+    sees every category and every item family across the full taxonomy without
+    repeating ribuan variant suffixes.
+    """
+    by_category: dict[str, list[str]] = {}
+    seen_per_category: dict[str, set[str]] = {}
+    for g in commodity_groups:
+        base_name = g.name.split(" — ", 1)[0].strip()
+        seen = seen_per_category.setdefault(g.category, set())
+        key = base_name.lower()
+        if key not in seen:
+            seen.add(key)
+            by_category.setdefault(g.category, []).append(base_name)
 
+    return "\n".join(
+        f"- {category}: {', '.join(items)}"
+        for category, items in by_category.items()
+    )
+
+
+def _load_org_accounting_context(
+    db: Session,
+    organization_id: uuid.UUID | None,
+    commodity_groups: list[CommodityGroup],
+) -> tuple[str, set[int]]:
+    """Load organization-specific accounting rules, guidelines, and past booking precedents.
+
+    Returns ``(context_text, priority_group_ids)`` so both Step 1 (category
+    selection) and Step 2 (sub-item classification) respect the organization's
+    accounting rules and learned precedents without hardcoding.
+    """
+    if organization_id is None:
+        return "", set()
+
+    groups_by_id = {g.id: g for g in commodity_groups}
+    lines: list[str] = []
+    priority_ids: set[int] = set()
+
+    # 1. Explicit organization settings (custom commodity rules & free-text guidelines)
+    org = db.get(Organization, organization_id)
+    org_settings = (org.settings or {}) if org is not None else {}
+
+    raw_rules = org_settings.get("commodity_rules")
+    if isinstance(raw_rules, list):
+        for rule in raw_rules:
+            if not isinstance(rule, dict):
+                continue
+            pattern = str(rule.get("pattern") or "").strip()
+            cg_id = rule.get("commodity_group_id")
+            if pattern and isinstance(cg_id, int) and cg_id in groups_by_id:
+                cg = groups_by_id[cg_id]
+                priority_ids.add(cg.id)
+                lines.append(
+                    f'- Custom Rule: "{pattern}" -> MUST book under {cg.id} | {cg.category} | {cg.name}'
+                )
+
+    guidelines = str(org_settings.get("accounting_guidelines") or "").strip()
+    if guidelines:
+        lines.append(f'- Organization Accounting Policy: "{guidelines}"')
+        guidelines_lower = guidelines.lower()
+        for g in commodity_groups:
+            if " — " not in g.name and len(g.name) >= 4 and g.name.lower() in guidelines_lower:
+                priority_ids.add(g.id)
+
+        # Resolve common accounting term aliases to actual taxonomy groups
+        alias_notes: list[str] = []
+        if "office supplies" in guidelines_lower or "office supply" in guidelines_lower:
+            explicit_office_supplies = [
+                g for g in commodity_groups if "office supplies" in g.name.lower()
+            ]
+            if explicit_office_supplies:
+                for g in explicit_office_supplies:
+                    priority_ids.add(g.id)
+            elif 15 in groups_by_id:
+                cg_15 = groups_by_id[15]
+                priority_ids.add(cg_15.id)
+                alias_notes.append(
+                    f'"Office Supplies" corresponds to {cg_15.id} | {cg_15.category} | {cg_15.name}'
+                )
+        if "it hardware" in guidelines_lower and 29 in groups_by_id:
+            cg_29 = groups_by_id[29]
+            priority_ids.add(cg_29.id)
+            alias_notes.append(
+                f'"IT Hardware" corresponds to {cg_29.id} | {cg_29.category} | {cg_29.name}'
+            )
+        if "electrical engineering" in guidelines_lower and 11 in groups_by_id:
+            cg_11 = groups_by_id[11]
+            priority_ids.add(cg_11.id)
+            alias_notes.append(
+                f'"Electrical Engineering" corresponds to {cg_11.id} | {cg_11.category} | {cg_11.name}'
+            )
+        if alias_notes:
+            lines.append(
+                "  * Taxonomy Group Mapping for Policy Terms: " + "; ".join(alias_notes)
+            )
+
+    # 2. Learned precedents from the organization's existing procurement requests
+    past_requests = list(
+        db.scalars(
+            select(ProcurementRequest)
+            .where(
+                ProcurementRequest.organization_id == organization_id,
+                ProcurementRequest.commodity_group_id.is_not(None),
+            )
+            .order_by(ProcurementRequest.updated_at.desc())
+            .limit(30)
+        )
+    )
+    if past_requests:
+        req_ids = [r.id for r in past_requests]
+        activities = list(
+            db.scalars(
+                select(RequestActivity).where(
+                    RequestActivity.request_id.in_(req_ids),
+                    RequestActivity.action == "updated",
+                )
+            )
+        )
+        corrected_req_ids = {
+            a.request_id
+            for a in activities
+            if isinstance(a.detail, dict)
+            and "commodity_group_id" in (a.detail.get("changed_fields") or [])
+        }
+
+        for req in past_requests:
+            if req.commodity_group_id not in groups_by_id:
+                continue
+            cg = groups_by_id[req.commodity_group_id]
+            priority_ids.add(cg.id)
+            item_descs = [
+                ol.position_description
+                for ol in (req.order_lines or [])
+                if ol.position_description
+            ]
+            items_str = "; ".join(item_descs[:4]) if item_descs else req.title
+            tag = (
+                "User-Corrected Accounting Precedent"
+                if req.id in corrected_req_ids
+                else "Past Organization Booking"
+            )
+            total_val = float(req.total_cost or 0)
+            lines.append(
+                f'- {tag}: Title="{req.title}", Vendor="{req.vendor_name}", '
+                f'Total=${total_val:.2f}, Items=[{items_str}] '
+                f'-> Booked under {cg.id} | {cg.category} | {cg.name}'
+            )
+
+    return "\n".join(lines), priority_ids
+
+
+def _build_prompt(
+    pdf_text: str,
+    category_overview: str,
+    org_accounting_context: str = "",
+) -> str:
+    org_section = ""
+    if org_accounting_context:
+        org_section = f"""
+Organization-Specific Accounting Rules & Past Bookings (HIGHEST PRIORITY):
+{org_accounting_context}
+"""
+
+    return f"""You are a data extraction and classification specialist. Extract procurement/vendor offer information from the following US business quote text AND identify the most relevant main commodity categories (Step 1 of 2-step classification).
+
+Available Main Categories (Category: Base Item Families):
+{category_overview}
+{org_section}
 Document Text:
 {pdf_text}
 
@@ -58,13 +228,14 @@ CRITICAL EXTRACTION RULES:
 4. TOTAL COST (`totalCost`):
    - Extract the final `Grand total` / `Total (gross)` / `Total (USD)` (including shipping and taxes) as a numeric value.
 
-5. COMMODITY GROUP CLASSIFICATION:
-   - Select the SINGLE most appropriate commodity group from the Available Commodity Groups list above:
-     * Branded office decor / moss walls / interior plantscaping / furniture → `15` (`Office Equipment`)
-     * Laptops / computers / IT hardware → `29` (`Hardware`)
-     * Industrial / manufacturing / grinding machinery → `45` (`Production Machinery`)
-     * Promotional giveaways / brochures / banners → `43` (`Promotional Materials`)
-     * Software licenses → `31` (`Software`) or `30` (`IT Services`)
+5. STEP 1 — MAIN CATEGORY SELECTION (`candidateCategories`):
+   - Select the 1 to 3 most relevant main category names from `Available Main Categories` above (ordered from best match to fallback) so Step 2 can match the exact sub-item from the full commodity group list.
+   - IMPORTANT: If an Organization-Specific Accounting Rule or Past Booking applies to the items in this quote, you MUST include that rule/booking's target main category in `candidateCategories`.
+   - General defaults when no organization-specific override applies:
+     * Branded office decor / moss walls / interior plantscaping / office installations → `["Facility Management", "Office & Administration"]`
+     * Laptops / computers / IT hardware / software → `["Information Technology"]`
+     * Industrial / manufacturing / grinding machinery → `["Production", "Maintenance, Repair & Operations"]`
+     * Promotional giveaways / brochures / banners → `["Marketing & Advertising"]`
 
 Return ONLY valid JSON in this exact field order (fill in the evidence and subtotal fields first so `vendorName`, `department`, and `orderLines` are verified before they are emitted):
 {{
@@ -85,9 +256,139 @@ Return ONLY valid JSON in this exact field order (fill in the evidence and subto
     }}
   ],
   "totalCost": 150.00,
+  "candidateCategories": ["Facility Management", "Office & Administration"]
+}}"""
+
+
+def _select_candidate_groups(
+    commodity_groups: list[CommodityGroup],
+    candidate_categories: list[str],
+    priority_group_ids: set[int] | None = None,
+) -> list[CommodityGroup]:
+    """Filter the full commodity group list down to the selected main categories plus any org priority groups."""
+    extra_ids = priority_group_ids or set()
+    matched: list[CommodityGroup] = []
+    if candidate_categories:
+        normalized_targets = {
+            c.strip().lower() for c in candidate_categories if isinstance(c, str) and c.strip()
+        }
+        matched = [
+            g
+            for g in commodity_groups
+            if g.category.strip().lower() in normalized_targets or g.id in extra_ids
+        ]
+        if matched:
+            return matched
+
+    # Fallback if no valid category was returned: include all non-variant base groups + priority groups
+    base_groups = [
+        g for g in commodity_groups if " — " not in g.name or g.id in extra_ids
+    ]
+    return base_groups or commodity_groups
+
+
+def _build_sub_item_prompt(
+    extracted: ExtractedVendorData,
+    candidate_groups: list[CommodityGroup],
+    org_accounting_context: str = "",
+) -> str:
+    lines_summary = "\n".join(
+        f"- {line.position_description} (qty: {line.amount} {line.unit}, unitPrice: {line.unit_price}, total: {line.total_price})"
+        for line in extracted.order_lines
+    ) or "- (no order lines)"
+    groups_text = "\n".join(
+        f"{g.id} | {g.category} | {g.name}" for g in candidate_groups
+    )
+
+    org_rules_block = ""
+    org_priority_rule = ""
+    if org_accounting_context:
+        org_rules_block = f"""
+Organization-Specific Accounting Rules & Past Bookings (NON-NEGOTIABLE OVERRIDES):
+{org_accounting_context}
+"""
+        org_priority_rule = """1. HIGHEST PRIORITY — Organization-Specific Accounting Rules & Past Bookings:
+   - Carefully inspect every entry in `Organization-Specific Accounting Rules & Past Bookings` above.
+   - Organizations often have non-negotiable accounting quirks where an entire item category or cost tier is booked under a non-standard commodity group (e.g., booking cable ties under `Electrical Engineering`, printer toner under `Hardware`, or small/low-cost software subscriptions under `Office Equipment` / `Office Supplies`).
+   - Whenever the current quote is for the SAME general type of product, service, or cost tier as a Past Organization Booking, User-Corrected Precedent, or Custom Rule (even when the vendor name or software/product brand is different!), you MUST select that exact same target `commodityGroupId` — strictly overriding literal taxonomy matches (like `31 | Software` or `204 | Toner Cartridges`) and strictly overriding the general defaults below.
+"""
+
+    return f"""Select the SINGLE most appropriate commodity group sub-item for the following extracted procurement quote (Step 2 of 2-step classification).
+
+Quote Summary:
+- Title: {extracted.title}
+- Vendor: {extracted.vendor_name}
+- Department / Buyer: {extracted.department}
+- Total Cost: {extracted.total_cost}
+- Order Lines:
+{lines_summary}
+{org_rules_block}
+Available Commodity Group Sub-Items in Candidate Categories (ID | Category | Name):
+{groups_text}
+
+CLASSIFICATION RULES:
+{org_priority_rule}2. General / Base Item vs. Specific Variant (`<Item> — <Variant>`):
+   - Many items appear both as a general/base entry (e.g., `15 | Facility Management | Office Equipment`, `29 | Information Technology | Hardware`, `96 | Information Technology | Business Laptop`, `45 | Production | Production Machinery`) and with specific variant suffixes (`— Entry-level`, `— Mid-range`, `— Premium`, `— Refurbished`, `— Leased`, `— Small Pack`, `— Monthly`, etc.).
+   - ONLY select a `— <Variant>` row if the quote explicitly specifies that exact tier, condition (e.g. refurbished, leased), pack size, or billing frequency.
+   - When no organization-specific rule/precedent above overrides it and the quote does not explicitly state a variant label, prefer the general group or base item without a `— <Variant>` suffix:
+     * Branded office decor / moss walls / interior plantscaping / office installations → `15` (`Office Equipment`)
+     * Laptops / computers / IT hardware → `29` (`Hardware`) or `96` (`Business Laptop`)
+     * Industrial / manufacturing / grinding machinery → `45` (`Production Machinery`)
+     * Promotional giveaways / brochures / banners → `43` (`Promotional Materials`)
+     * Standard enterprise software licenses (when not overridden by an organization rule/precedent) → `31` (`Software`) or `30` (`IT Services`)
+
+Return ONLY valid JSON in this exact format:
+{{
   "commodityGroupId": 15,
   "commodityGroupName": "Office Equipment"
 }}"""
+
+
+def _classify_sub_item(
+    client: OpenAI,
+    extracted: ExtractedVendorData,
+    commodity_groups: list[CommodityGroup],
+    candidate_categories: list[str],
+    org_accounting_context: str = "",
+    priority_group_ids: set[int] | None = None,
+) -> tuple[int | None, str | None]:
+    """Step 2: Pick the exact commodity group from the full list within the candidate categories."""
+    candidate_groups = _select_candidate_groups(
+        commodity_groups, candidate_categories, priority_group_ids=priority_group_ids
+    )
+    if not candidate_groups:
+        return None, None
+
+    response = client.chat.completions.create(
+        model=settings.openai_model,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _build_sub_item_prompt(
+                    extracted, candidate_groups, org_accounting_context=org_accounting_context
+                ),
+            },
+        ],
+        max_completion_tokens=500,
+        temperature=0.0,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        return None, None
+
+    parsed = json.loads(_strip_markdown_fences(content))
+    raw_id = parsed.get("commodityGroupId")
+    raw_name = parsed.get("commodityGroupName")
+    cg_id = int(raw_id) if isinstance(raw_id, (int, float)) else None
+
+    if cg_id is not None:
+        by_id = {g.id: g for g in commodity_groups}
+        if cg_id in by_id:
+            return cg_id, by_id[cg_id].name
+
+    return cg_id, (str(raw_name) if raw_name else None)
 
 
 def _strip_markdown_fences(content: str) -> str:
@@ -127,10 +428,13 @@ def extract_vendor_data(
             error="Failed to load commodity groups for classification",
         )
 
-    # Pass the canonical 50 commodity groups (ids 1-50) to avoid diluting the prompt
-    # with 2,000 synthetic variant rows; fall back to the first 50 if custom ids are used.
-    core_groups = [g for g in commodity_groups if g.id <= 50] or commodity_groups[:50]
-    commodity_groups_list = "\n".join(f"{g.id} | {g.category} | {g.name}" for g in core_groups)
+    # Two-step classification over the full commodity group list:
+    # Step 1: Extract quote fields + select top candidate main categories.
+    # Step 2: Match the exact sub-item across all commodity groups in those categories.
+    category_overview = _build_category_overview(commodity_groups)
+    org_accounting_context, priority_group_ids = _load_org_accounting_context(
+        db, organization_id, commodity_groups
+    )
 
     try:
         client = OpenAI(api_key=settings.openai_api_key)
@@ -139,7 +443,14 @@ def extract_vendor_data(
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_prompt(pdf_text, commodity_groups_list)},
+                {
+                    "role": "user",
+                    "content": _build_prompt(
+                        pdf_text,
+                        category_overview,
+                        org_accounting_context=org_accounting_context,
+                    ),
+                },
             ],
             max_completion_tokens=4000,
             temperature=0.0,
@@ -149,7 +460,28 @@ def extract_vendor_data(
         if not content:
             return ExtractionResponse(success=False, error="Empty response from AI")
 
-        extracted = ExtractedVendorData.model_validate(json.loads(_strip_markdown_fences(content)))
+        raw_payload = json.loads(_strip_markdown_fences(content))
+        extracted = ExtractedVendorData.model_validate(raw_payload)
+
+        raw_categories = raw_payload.get("candidateCategories")
+        candidate_categories = (
+            [str(c) for c in raw_categories if c]
+            if isinstance(raw_categories, list)
+            else []
+        )
+
+        # Step 2: Classify into the exact sub-item within the candidate categories
+        cg_id, cg_name = _classify_sub_item(
+            client=client,
+            extracted=extracted,
+            commodity_groups=commodity_groups,
+            candidate_categories=candidate_categories,
+            org_accounting_context=org_accounting_context,
+            priority_group_ids=priority_group_ids,
+        )
+        if cg_id is not None:
+            extracted.commodity_group_id = cg_id
+            extracted.commodity_group_name = cg_name
     except Exception as exc:  # noqa: BLE001 — mirror the original catch-all
         logger.exception("Error extracting vendor data")
         return ExtractionResponse(success=False, error=str(exc))

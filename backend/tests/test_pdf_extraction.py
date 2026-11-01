@@ -198,8 +198,8 @@ EXPECTED_QUOTES: dict[str, ExpectedQuote] = {
         forbidden_line_keywords=(),
         net_total=1409.06,
         gross_total=1534.59,
-        # 29 = Hardware (original 50), 69 = Business Laptop (expanded taxonomy)
-        commodity_group_ids=(29, 69),
+        # 29 = Hardware (original 50), 96 = Business Laptop (expanded taxonomy)
+        commodity_group_ids=(29, 69, 96),
         commodity_group_names=("Hardware", "Business Laptop"),
         expected_text_snippets=("2214703918", "Apple Business Team", "94-2404110", "MacBook Air"),
     ),
@@ -493,6 +493,147 @@ def test_pdf_extraction_matches_ground_truth(filename: str, monkeypatch: pytest.
         + "\n  - ".join(issues)
         + f"\n\nActual payload:\n{ext_resp.text}"
     )
+
+
+@pytest.mark.skipif(
+    not (settings.openai_api_key or os.environ.get("OPENAI_API_KEY")),
+    reason="OPENAI_API_KEY is required for live LLM extraction tests",
+)
+def test_accounting_quirks_classified_correctly(monkeypatch: pytest.MonkeyPatch):
+    """Verify the 3 non-negotiable accounting quirks from the issue description:
+    1. Cable ties -> 11 (Electrical Engineering)
+    2. Printer toner -> 29 (Hardware)
+    3. Small software subscriptions -> 15 (Office Equipment / Office Supplies)
+    learned from past organization bookings & accounting policy without hardcoding.
+    """
+    if not settings.openai_api_key and os.environ.get("OPENAI_API_KEY"):
+        monkeypatch.setattr(settings, "openai_api_key", os.environ["OPENAI_API_KEY"])
+
+    headers = _get_auth_headers()
+
+    # Seed past requests in the organization reflecting how the org books these 3 quirks
+    seed_precedents = [
+        {
+            "requestorName": "Alex Admin",
+            "titleShortDescription": "Cable Ties",
+            "vendorName": "Northstar Industries LP",
+            "vatId": "10-0004055",
+            "commodityGroupId": 11,  # Electrical Engineering
+            "totalCost": 38.0,
+            "department": "Facilities",
+            "orderLines": [
+                {
+                    "positionDescription": "Nylon cable ties 200mm, pack of 100",
+                    "unitPrice": 9.5,
+                    "amount": 4.0,
+                    "unit": "packs",
+                    "totalPrice": 38.0,
+                }
+            ],
+        },
+        {
+            "requestorName": "Alex Admin",
+            "titleShortDescription": "Laser Printer Toner",
+            "vendorName": "Lakeview Supply LP",
+            "vatId": "10-0042983",
+            "commodityGroupId": 29,  # IT Hardware
+            "totalCost": 262.0,
+            "department": "IT",
+            "orderLines": [
+                {
+                    "positionDescription": "Toner cartridge magenta",
+                    "unitPrice": 131.0,
+                    "amount": 2.0,
+                    "unit": "pieces",
+                    "totalPrice": 262.0,
+                }
+            ],
+        },
+        {
+            "requestorName": "Alex Admin",
+            "titleShortDescription": "Small Team SaaS Tool Subscription",
+            "vendorName": "Delmar Systems Inc.",
+            "vatId": "10-0045416",
+            "commodityGroupId": 15,  # Office Equipment (Office Supplies)
+            "totalCost": 45.0,
+            "department": "Operations",
+            "orderLines": [
+                {
+                    "positionDescription": "Small software subscription - team note-taking app (monthly)",
+                    "unitPrice": 15.0,
+                    "amount": 3.0,
+                    "unit": "licenses",
+                    "totalPrice": 45.0,
+                }
+            ],
+        },
+    ]
+
+    created_ids: list[str] = []
+    try:
+        for req in seed_precedents:
+            r_create = client.post("/requests", json=req, headers=headers)
+            assert r_create.status_code == 201, r_create.text
+            created_ids.append(r_create.json()["id"])
+
+        cases = [
+            (
+                "cable_ties",
+                """Quote No. Q-2026-901
+Seller: Meridian Components Group | 400 Industrial Pkwy | Detroit, MI
+EIN: 10-0016220
+Prepared for: Acme Corp, Attn: Facilities & Wiring
+
+Pos  Description                                      Qty      Unit Price    Total
+1    UV-Resistant Black Zip / Cable Ties 300mm        10 pack  $12.50        $125.00
+Items subtotal (net): $125.00
+Grand total (USD): $125.00""",
+                11,
+                "Electrical Engineering",
+            ),
+            (
+                "printer_toner",
+                """Quote No. Q-2026-902
+Seller: Cedar Supply Corp. | 100 Market St | Chicago, IL
+EIN: 10-0091643
+Prepared for: Acme Corp, Attn: Office IT
+
+Pos  Description                                      Qty      Unit Price    Total
+1    High-Yield Black Laser Printer Toner Cartridge   3 ea.    $149.00       $447.00
+2    Cyan Laser Printer Toner Cartridge               2 ea.    $135.00       $270.00
+Items subtotal (net): $717.00
+Grand total (USD): $717.00""",
+                29,
+                "Hardware",
+            ),
+            (
+                "small_software_subscription",
+                """Quote No. Q-2026-903
+Seller: Vertex Solutions Inc. | 55 Tech Way | Austin, TX
+EIN: 10-0018653
+Prepared for: Acme Corp, Attn: Operations
+
+Pos  Description                                      Qty      Unit Price    Total
+1    QuickTimer Pro - Small Monthly Software Subscription (2 seats)  2 lic.  $19.00  $38.00
+Items subtotal (net): $38.00
+Grand total (USD): $38.00""",
+                15,
+                "Office Equipment",
+            ),
+        ]
+
+        for label, quote_text, expected_id, expected_name in cases:
+            r_ext = client.post("/extraction", json={"text": quote_text}, headers=headers)
+            assert r_ext.status_code == 200, r_ext.text
+            parsed = ExtractionResponse.model_validate(r_ext.json())
+            assert parsed.success and parsed.data is not None, f"{label} failed: {r_ext.text}"
+            assert parsed.data.commodity_group_id == expected_id, (
+                f"{label}: expected commodityGroupId={expected_id} ({expected_name!r}), "
+                f"got {parsed.data.commodity_group_id} ({parsed.data.commodity_group_name!r})"
+            )
+    finally:
+        for rid in created_ids:
+            client.delete(f"/requests/{rid}", headers=headers)
 
 
 if __name__ == "__main__":

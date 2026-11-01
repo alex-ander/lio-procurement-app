@@ -11,6 +11,16 @@ MemberRole = Literal["admin", "buyer", "requester"]
 ConfigurableRequiredField = Literal["vat_id", "department"]
 
 
+class CommodityClassificationRule(BaseModel):
+    """Per-organization custom rule mapping an item/condition description to a commodity group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str
+    commodity_group_id: int
+    commodity_group_name: str | None = None
+
+
 class OrganizationSettings(BaseModel):
     """Per-organization configuration. Stored as JSONB, validated here.
 
@@ -21,6 +31,8 @@ class OrganizationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     required_fields: list[ConfigurableRequiredField] = Field(default_factory=list)
+    commodity_rules: list[CommodityClassificationRule] | None = None
+    accounting_guidelines: str | None = None
 
 
 class OrganizationCreate(BaseModel):

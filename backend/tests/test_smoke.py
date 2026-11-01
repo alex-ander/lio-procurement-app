@@ -1056,6 +1056,251 @@ def test_extraction_attaches_catalog_suggestions(monkeypatch):
     assert abs(top_suggestion["savings"] - 102.11) <= 0.02
 
 
+def test_two_step_commodity_group_classification_uses_full_list(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from app.core.config import settings
+    import app.services.extraction as extraction_mod
+
+    token = _signin("requester@acme.com")
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+
+    captured_prompts: list[str] = []
+
+    step1_json = json.dumps(
+        {
+            "title": "Refurbished Business Laptops",
+            "vendorName": "Hudson Systems Inc.",
+            "vatId": "12-3456789",
+            "department": "IT Department",
+            "orderLines": [
+                {
+                    "positionDescription": "Refurbished 14-inch Business Laptop",
+                    "unitPrice": 890.0,
+                    "amount": 5.0,
+                    "unit": "pieces",
+                    "totalPrice": 4450.0,
+                }
+            ],
+            "totalCost": 4450.0,
+            "candidateCategories": ["Information Technology"],
+        }
+    )
+    # 1746 = ('Information Technology', 'Business Laptop — High-performance') in the full 2,000 list
+    step2_json = json.dumps(
+        {
+            "commodityGroupId": 1746,
+            "commodityGroupName": "Business Laptop — High-performance",
+        }
+    )
+
+    def _fake_create(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        captured_prompts.append(user_msg)
+        reply = step1_json if len(captured_prompts) == 1 else step2_json
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply))]
+        )
+
+    class _FakeTwoStepOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=_fake_create)
+            )
+
+    monkeypatch.setattr(extraction_mod, "OpenAI", _FakeTwoStepOpenAI)
+
+    r = client.post(
+        "/extraction",
+        json={"text": "Quote for 5x High-performance Business Laptops"},
+        headers=_auth(token),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert len(captured_prompts) == 2
+
+    # Step 1 prompt includes all 22 main categories and their base item families
+    assert "Information Technology:" in captured_prompts[0]
+    assert "Sustainability & Environment:" in captured_prompts[0]
+    assert "Business Laptop — High-performance" not in captured_prompts[0]
+
+    # Step 2 prompt includes the full sub-item list for Information Technology (including IDs > 50 and > 380)
+    assert "29 | Information Technology | Hardware" in captured_prompts[1]
+    assert "96 | Information Technology | Business Laptop" in captured_prompts[1]
+    assert "1746 | Information Technology | Business Laptop — High-performance" in captured_prompts[1]
+    assert "1 | General Services | Accommodation Rentals" not in captured_prompts[1]
+    assert "11 | Facility Management | Electrical Engineering" not in captured_prompts[1]
+
+    # Final response resolves the exact sub-item from the full 2,000-row list
+    assert body["data"]["commodityGroupId"] == 1746
+    assert body["data"]["commodityGroupName"] == "Business Laptop — High-performance"
+
+
+def test_org_accounting_precedents_and_guidelines_in_two_step_classification(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from app.core.config import settings
+    import app.services.extraction as extraction_mod
+
+    admin_token = _signin("admin@acme.com")
+    requester_token = _signin("requester@acme.com")
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+
+    # 1. Create and correct a past request for Cable Ties -> 11 (Electrical Engineering)
+    created_req = client.post(
+        "/requests",
+        json={
+            "requestorName": "Rene Requester",
+            "titleShortDescription": "Nylon Cable Ties",
+            "vendorName": "Northstar Industries LP",
+            "vatId": "10-0004055",
+            "commodityGroupId": 151,  # initially Fasteners Assortment
+            "totalCost": 45.0,
+            "department": "Facilities",
+            "orderLines": [
+                {
+                    "positionDescription": "Nylon cable ties 200mm black, 100-pack",
+                    "unitPrice": 9.0,
+                    "amount": 5.0,
+                    "unit": "packs",
+                    "totalPrice": 45.0,
+                }
+            ],
+        },
+        headers=_auth(requester_token),
+    ).json()
+    req_id = created_req["id"]
+
+    # User updates/corrects the commodity group to 11 (Electrical Engineering)
+    r_upd = client.put(
+        f"/requests/{req_id}",
+        json={
+            "requestorName": "Rene Requester",
+            "title": "Nylon Cable Ties",
+            "vendorName": "Northstar Industries LP",
+            "vatId": "10-0004055",
+            "commodityGroupId": 11,
+            "totalCost": 45.0,
+            "department": "Facilities",
+            "orderLines": [
+                {
+                    "positionDescription": "Nylon cable ties 200mm black, 100-pack",
+                    "unitPrice": 9.0,
+                    "amount": 5.0,
+                    "unit": "packs",
+                    "totalPrice": 45.0,
+                }
+            ],
+        },
+        headers=_auth(requester_token),
+    )
+    assert r_upd.status_code == 200, r_upd.text
+
+    # 2. Configure organization accounting guidelines in Settings
+    guidelines_text = (
+        "For us, cable ties always have to be booked under Electrical Engineering, "
+        "printer toner under IT Hardware, and small software subscriptions under Office Supplies."
+    )
+    r_set = client.patch(
+        "/organizations/me/settings",
+        json={
+            "required_fields": [],
+            "accounting_guidelines": guidelines_text,
+            "commodity_rules": [
+                {"pattern": "Printer toner", "commodity_group_id": 29},
+            ],
+        },
+        headers=_auth(admin_token),
+    )
+    assert r_set.status_code == 200, r_set.text
+    assert r_set.json()["accounting_guidelines"] == guidelines_text
+    assert r_set.json()["commodity_rules"][0]["commodity_group_name"] == "Hardware"
+
+    captured_prompts: list[str] = []
+    # Even if Step 1 only returned "Office & Administration" for a toner quote,
+    # priority_group_ids ensures 11 (Electrical Engineering), 15 (Office Equipment),
+    # and 29 (Hardware) are included in Step 2's candidate list.
+    step1_json = json.dumps(
+        {
+            "title": "LaserJet Toner Cartridges",
+            "vendorName": "Lakeview Supply LP",
+            "vatId": "10-0042983",
+            "department": "IT",
+            "orderLines": [
+                {
+                    "positionDescription": "Toner cartridge black, high-yield",
+                    "unitPrice": 186.0,
+                    "amount": 2.0,
+                    "unit": "pieces",
+                    "totalPrice": 372.0,
+                }
+            ],
+            "totalCost": 372.0,
+            "candidateCategories": ["Office & Administration"],
+        }
+    )
+    step2_json = json.dumps(
+        {
+            "commodityGroupId": 29,
+            "commodityGroupName": "Hardware",
+        }
+    )
+
+    def _fake_create(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        captured_prompts.append(user_msg)
+        reply = step1_json if len(captured_prompts) == 1 else step2_json
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply))]
+        )
+
+    class _FakeAccountingOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=_fake_create)
+            )
+
+    monkeypatch.setattr(extraction_mod, "OpenAI", _FakeAccountingOpenAI)
+
+    try:
+        r_ext = client.post(
+            "/extraction",
+            json={"text": "Quote for 2x Toner cartridge black, high-yield"},
+            headers=_auth(requester_token),
+        )
+        assert r_ext.status_code == 200, r_ext.text
+        ext_body = r_ext.json()
+        assert ext_body["success"] is True
+        assert len(captured_prompts) == 2
+
+        # Both Step 1 and Step 2 receive the learned user-corrected precedent and org accounting rules
+        for prompt in captured_prompts:
+            assert "User-Corrected Accounting Precedent" in prompt
+            assert "Nylon cable ties 200mm black" in prompt
+            assert "11 | Facility Management | Electrical Engineering" in prompt
+            assert '"Office Supplies" corresponds to 15 | Facility Management | Office Equipment' in prompt
+            assert '"IT Hardware" corresponds to 29 | Information Technology | Hardware' in prompt
+
+        # Step 2 candidate list includes priority groups 11, 15, and 29 even though Step 1 only returned "Office & Administration"
+        assert "11 | Facility Management | Electrical Engineering" in captured_prompts[1]
+        assert "15 | Facility Management | Office Equipment" in captured_prompts[1]
+        assert "29 | Information Technology | Hardware" in captured_prompts[1]
+        assert ext_body["data"]["commodityGroupId"] == 29
+        assert ext_body["data"]["commodityGroupName"] == "Hardware"
+    finally:
+        client.delete(f"/requests/{req_id}", headers=_auth(admin_token))
+        client.patch(
+            "/organizations/me/settings",
+            json={
+                "required_fields": [],
+                "accounting_guidelines": None,
+                "commodity_rules": None,
+            },
+            headers=_auth(admin_token),
+        )
+
+
 if __name__ == "__main__":
     test_full_user_journey()
     test_pdf_parse()

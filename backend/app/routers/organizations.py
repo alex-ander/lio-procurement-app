@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_membership, get_current_user, require_org_admin
 from app.db.session import get_db
 from app.models import (
+    CommodityGroup,
     Organization,
     OrganizationInvite,
     OrganizationMember,
@@ -79,7 +80,11 @@ def get_my_organization(
     )
 
 
-@router.get("/me/settings", response_model=OrganizationSettings)
+@router.get(
+    "/me/settings",
+    response_model=OrganizationSettings,
+    response_model_exclude_none=True,
+)
 def get_settings(
     membership: OrganizationMember = Depends(get_current_membership),
     db: Session = Depends(get_db),
@@ -88,16 +93,53 @@ def get_settings(
     return OrganizationSettings(**(org.settings or {}))
 
 
-@router.patch("/me/settings", response_model=OrganizationSettings)
+@router.patch(
+    "/me/settings",
+    response_model=OrganizationSettings,
+    response_model_exclude_none=True,
+)
 def update_settings(
     payload: OrganizationSettings,
     membership: OrganizationMember = Depends(require_org_admin),
     db: Session = Depends(get_db),
 ) -> OrganizationSettings:
     org = db.get(Organization, membership.organization_id)
-    org.settings = payload.model_dump()
+    merged = dict(org.settings or {})
+    updates = payload.model_dump(exclude_unset=True)
+
+    if "commodity_rules" in updates and updates["commodity_rules"] is not None:
+        normalized_rules: list[dict] = []
+        for rule in updates["commodity_rules"]:
+            pattern = (rule.get("pattern") or "").strip()
+            if not pattern:
+                continue
+            cg = db.get(CommodityGroup, rule["commodity_group_id"])
+            if cg is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Unknown commodity_group_id: {rule['commodity_group_id']}",
+                )
+            normalized_rules.append(
+                {
+                    "pattern": pattern,
+                    "commodity_group_id": cg.id,
+                    "commodity_group_name": cg.name,
+                }
+            )
+        updates["commodity_rules"] = normalized_rules
+
+    if "accounting_guidelines" in updates and updates["accounting_guidelines"] is not None:
+        updates["accounting_guidelines"] = updates["accounting_guidelines"].strip()
+
+    for key, value in updates.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+
+    org.settings = merged
     db.commit()
-    return payload
+    return OrganizationSettings(**org.settings)
 
 
 @router.get("/me/members", response_model=MembersResponse)
